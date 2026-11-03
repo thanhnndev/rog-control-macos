@@ -33,8 +33,8 @@ are untested; the power-limit ranges are the GA403WM's. Per-feature detail and t
 
 ## Screenshots
 
-<p align="center"><img src="docs/images/rogcontrol-popover.png" alt="RogControl menu bar panel" width="320">&nbsp;&nbsp;<img src="docs/images/rogcontrol-window.png" alt="RogControl window, Performance" width="560"></p>
-<p align="center"><img src="docs/images/fan-curves.png" alt="RogControl window, Performance › Advanced: custom limits and firmware fan curve" width="640"></p>
+<p align="center"><img src="docs/images/rogcontrol-popover-rog.png" alt="RogControl menu bar panel" width="320">&nbsp;&nbsp;<img src="docs/images/rogcontrol-window-rog.png" alt="RogControl window, Performance" width="560"></p>
+<p align="center"><img src="docs/images/fan-curves-rog.png" alt="RogControl window, Performance › Advanced: custom limits and firmware fan curve" width="640"></p>
 
 ## Releases
 
