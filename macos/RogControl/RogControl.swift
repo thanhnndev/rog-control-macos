@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause-Clear
 // Copyright (c) 2026 thanhnndev and contributors
 // RogControl: a small ROG Control Center for macOS on the GA403WM (ROG Zephyrus G14 2025): performance mode (Silent,
-// Performance, Turbo, Manual power limits), battery charge limit, CPU temperature / package power / fan speeds, GPU MUX
+// Balanced, Turbo, Manual power limits), battery charge limit, CPU temperature / package power / fan speeds, GPU MUX
 // state. Settings are kept per power source (AC / battery) and applied again when the source changes and at login, as asusd
 // does. Native app window and menu bar popover, SwiftUI, SF Symbols only.
 //
@@ -10,7 +10,7 @@
 // debug.amdcppc.sensors of kexts/AmdCppc.
 //
 // Command line (same binary):
-//   RogControl --bench [seconds]   runs Silent, Performance and Turbo in turn under full load on every CPU and prints package
+//   RogControl --bench [seconds]   runs Silent, Balanced and Turbo in turn under full load on every CPU and prints package
 //                                  power, Tctl, fan speeds and clocks per mode; puts the previous mode back afterwards
 // Build: scripts/build-rogcontrol.sh
 import AppKit
@@ -300,7 +300,7 @@ enum Camera {
 enum Mode: String, CaseIterable, Identifiable {
     case silent, performance, turbo, manual
     var id: String { rawValue }
-    var title: String { ["silent": "Silent", "performance": "Performance", "turbo": "Turbo", "manual": "Custom"][rawValue]! }   // manual is shown as Custom
+    var title: String { ["silent": "Silent", "performance": "Balanced", "turbo": "Turbo", "manual": "Custom"][rawValue]! }   // manual is shown as Custom
     var symbol: String {
         // one family: filled glyphs at one weight, drawn in the same chamfered badge (ModeBadge)
         ["silent": "leaf.fill", "performance": "gauge.with.needle.fill", "turbo": "flame.fill", "manual": "dial.low.fill"][rawValue]!
@@ -639,7 +639,7 @@ extension Mode {
     var short: String {
         switch self {
         case .silent: return "Quiet"
-        case .performance: return "Balanced"
+        case .performance: return "All-round"
         case .turbo: return "Max power"
         case .manual: return "Your limits"
         }

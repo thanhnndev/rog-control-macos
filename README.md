@@ -29,7 +29,7 @@ boot without them (OpenCore picker, remove the kext from `config.plist`).
 ## Status
 
 Reference unit: GA403WM, Ryzen AI 9 HX 370. Owner-confirmed on 2026-10-12, when the machine ran macOS 15 (24H32): profiles
-(Silent / Performance / Turbo), Manual power limits, fan curves, fan speeds, charge limit (60 / 80 / 100 %), per-power-source
+(Silent / Balanced / Turbo), Manual power limits, fan curves, fan speeds, charge limit (60 / 80 / 100 %), per-power-source
 settings, keyboard light, Slash lighting, the RogControl app. macOS 26 (Tahoe) has **not** been checked. Other ASUS models
 are untested; the power-limit ranges are the GA403WM's. Per-feature detail and the open items are in
 [docs/ASUSCTL-MACOS.md](docs/ASUSCTL-MACOS.md).

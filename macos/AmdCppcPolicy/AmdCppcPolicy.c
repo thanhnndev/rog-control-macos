@@ -19,7 +19,9 @@ static int sleeping, lastEpp = -1, failures;
 static int number(const char *key) { int v = -1; size_t n = sizeof(v); return sysctlbyname(key, &v, &n, NULL, 0) ? -1 : v; }
 static int string(const char *key, char *buf, size_t cap) { size_t n = cap; memset(buf, 0, cap); return sysctlbyname(key, buf, &n, NULL, 0); }
 static int writeInt(const char *key, int v) { return sysctlbyname(key, NULL, NULL, &v, sizeof(v)); }
-static int preference(int ac, int profile) { return profile == 2 ? 255 : !ac ? 191 : profile == 1 ? 0 : 128; }
+// EPP per ASUS profile, as asusctl does with platform_profile_linked_epp (asusd/src/config.rs defaults): Quiet -> power 255,
+// Balanced -> balance_power 191, Performance/Turbo -> performance 0. Turbo on battery stays 191 (RogControl offers no Turbo there).
+static int preference(int ac, int profile) { return profile == 2 ? 255 : (ac && profile == 1) ? 0 : 191; }
 // Parse every report group and ensure its multiplicity covers all logical CPUs.
 static int verify(const char *report, int epp, int requireEnabled) {
     char copy[32768]; snprintf(copy, sizeof(copy), "%s", report);
@@ -96,7 +98,7 @@ static int load(int workers) {
     return result;
 }
 static int test(void) {
-    if (preference(1,0)!=128 || preference(1,1)!=0 || preference(1,2)!=255 || preference(0,0)!=191 || preference(0,1)!=191) return 1;
+    if (preference(1,0)!=191 || preference(1,1)!=0 || preference(1,2)!=255 || preference(0,0)!=191 || preference(0,1)!=191) return 1;
     if (snapshot("baseline") || apply(0) || snapshot("CPPC performance") || load(1) || load(24)) { apply(-1); return 1; }
     // Exercise the same notification state machine; this is not a physical sleep test.
     sleeping=1; if (apply(128)) return 1;
