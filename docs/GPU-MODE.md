@@ -1,6 +1,6 @@
 # GPU mode (Eco / Standard / Optimized) on the GA403WM, macOS 26
 
-Status: built, **not installed or booted**. Needs one reboot to test (see "Install batch").
+Status: StrixDgpuGate 8b33c13 verified live (boot 2026-11-09 13:06: dsm0 0, dsm1A 0, ps3 0, GSTA 1->0, PSC 3, vendor 0xFFFF, no panic, 890M fine). AsusWmi 0.3.0 (ABI 6) and RogControl 0.6.0 are built, not installed.
 
 ## Mechanism
 The NullMoth NVIDIA stack (NVRM 2.7.1, NVRMFB, NVAccel, NVRMAGDC) binds the RTX at boot and has no runtime power
@@ -49,8 +49,41 @@ disabled in the UI.
 * Remove StrixDgpuGate.kext: NVRM binds as before.
 * First install test: boot-arg `strixgate_dry=1` claims the card (NVRM stays off) without powering it off.
 
+## Sleep / wake with the RTX off (code review, not tested)
+
+State seen live with the RTX off: PEGP and HDAU IOPCIDevice nodes report PM CurrentPowerState 2 of 3 (IOPCIFamily still thinks the
+functions are on); GPP9 PEGP firmware state is `_PSC 3`, `DGPS 1`, `OMPR 2`; `PG00` is off (`GSTA 0`).
+
+What happens (from the DSDT; IOPCIFamily source was not available, so its part is an expectation to confirm by trace):
+* System sleep: IOPCIFamily saves config space of PEGP/HDAU (reads 0xFFFF) and writes PMCSR D3 (dropped, no link). Harmless as long as the
+  save is not used as truth. On wake it restores the saved values: writes to an absent device are dropped.
+* Risk A (main one): if the PM tree ever drives PEGP back to D0 through ACPI, `PEGP._PS0` runs because `DGPS != 0`, and that calls
+  `PG00._ON`: the RTX powers up behind the gate (rail on, link trained, config restore races). The gate then sees GSTA 1.
+* Risk B: the firmware `_WAK`/EC path could re-enable the rail (EC `VGAT`) on wake; same visible symptom as A (GSTA 1).
+* Gate behaviour today: `kIOMessageSystemHasPoweredOn` schedules `powerOff()` after 3 s; it reads GSTA, skips if 0, else repeats
+  `_DSM 0x1A` -> D3hot -> `_PS3`. That covers A and B. It does not need `WillSleep`: the card is already off, and powering a card off
+  just before sleep adds a second ACPI transition inside the sleep window for no gain.
+* Gate weak spots to fix (small, not built yet):
+  1. `offCall` is not `THREAD_CALL_OPTIONS_ONCE`: two wake messages (dark wake then full wake) can run `powerOff()` concurrently.
+     Allocate with `thread_call_allocate_with_options(..., THREAD_CALL_OPTIONS_ONCE)`.
+  2. `powerOff()` overwrites `gsta-before` with 0 on a no-op wake; keep the first-boot trace in `gsta-boot` and add a `wake-count`
+     and `gsta-wake` (GSTA seen at the last wake) so a trace shows whether A/B happened.
+  3. If the re-off after wake fails (GSTA still 1), the card stays on and `gate-powered-off` is false: the app already shows
+     "power-off pending"; also log it (`wake re-off failed`).
+* Risks that stay: a wake where the EC cut the rail while `GSTA` still says 1 (stale) would make `_DSM`/`_PS3` run on a dead card:
+  the `_PS3` is guarded by `GSTA` inside `PG00._OFF`, so it returns without touching the rail.
+* Test (owner starts): `ioreg -c StrixDgpuGate` before and after one sleep: `gate-powered-off Yes`, `pg00-sta 0`, `vendor-after`; then
+  `log show --predicate 'eventMessage contains "StrixDgpuGate"'` for the wake line.
+
 ## Install batch (for the main session, after owner OK)
-1. `build/AsusWmi.kext` (0.3.0, ABI 6) and `build/StrixDgpuGate.kext` (0.1.0) via `scripts/build.sh AsusWmi StrixDgpuGate`
-   (`MACKERNELSDK=…/ga403wm-hackintosh/build/MacKernelSDK`), RogControl.app via `scripts/build-rogcontrol.sh`.
-2. Reboot once with Standard stored (no behaviour change; verify AsusWmi ABI 6, `ioreg -c StrixDgpuGate`).
-3. Set Eco in the app, optionally add `strixgate_dry=1` first, reboot: expect `gate-held`, no NVRM; then without dry: `gate-powered-off`, `pg00-sta 0`.
+Builds (this tree, `MACKERNELSDK=…/ga403wm-hackintosh/build/MacKernelSDK scripts/build.sh AsusWmi StrixDgpuGate`, `scripts/build-rogcontrol.sh`):
+* StrixDgpuGate 8b33c13: UUID D48A1ED0-8111-33B7-AEDB-4EF1113343C8 (already installed, OC Kernel Add #47)
+* AsusWmi 0.3.0 ABI 6: UUID 42C34ABF-6887-31BE-8FF5-9A9E0096C6EB (executable sha256 84e2a660…687b)
+* RogControl 0.6.0 (ad-hoc signed, x86_64)
+
+Steps:
+1. `scripts/macos-install-kext.sh AsusWmi` (backs the old kext up to `EFI/OC/Kexts-backup`; config.plist untouched, it already lists AsusWmi).
+   Undo: `scripts/macos-install-kext.sh --undo AsusWmi`.
+2. `scripts/build-rogcontrol.sh --install` (copies to /Applications, restarts the LaunchAgent). Undo: reinstall rogcontrol-v0.5.3.
+3. Reboot once. Check: `sysctl debug.asuswmi.status` shows `gpu_mode`, the app GPU tile reads "Now: RTX off" with Eco selected and no
+   "Restart required".
