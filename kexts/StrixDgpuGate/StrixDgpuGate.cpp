@@ -34,7 +34,7 @@
 static void cp(char *d, const char *s, size_t n) { size_t i = 0; for (; i + 1 < n && s[i]; i++) d[i] = s[i]; d[i] = 0; }
 static bool gHeld, gOff, gTripped, gDry;
 static int gEffective = 0;
-static uint32_t gSta = ~0u;
+static uint32_t gSta = ~0u, gGstaBefore = ~0u, gGstaAfter = ~0u, gPsc = ~0u, gVendorAfter = ~0u;
 static char gState[96] = "not probed";
 class StrixDgpuGate;
 static StrixDgpuGate *gInfo;
@@ -95,6 +95,10 @@ public:
         setProperty("gate-powered-off", gOff);
         setProperty("gate-tripped", gTripped);
         if (gSta != ~0u) setProperty("pg00-sta", (unsigned long long)gSta, 32);
+        if (gGstaBefore != ~0u) setProperty("gsta-before", (unsigned long long)gGstaBefore, 32);
+        if (gGstaAfter != ~0u) setProperty("gsta-after", (unsigned long long)gGstaAfter, 32);
+        if (gPsc != ~0u) setProperty("psc", (unsigned long long)gPsc, 32);
+        if (gVendorAfter != ~0u) setProperty("vendor-after", (unsigned long long)gVendorAfter, 32);
         setProperty("gate-state", gState);
     }
 };
@@ -235,17 +239,41 @@ static bool hasForeignChild(IOService *dev)
     return any;
 }
 
-// PMCSR D3hot on both functions, then PG00._OFF (Linux runtime D3cold order). Refuses if any other driver is on either function.
+// The firmware's own Optimus path (what Windows/Linux drive): PEGP._DSM(NVOP, func 0x1A, FLCH=1 OPCE=3) sets OMPR=3, then both
+// functions go to D3hot via PMCSR, then PEGP._PS3 runs PG00._OFF. IOACPIPlatformDevice::evaluate* accepts a single NameSeg only,
+// so every call is made on the owning device (GSTA on GPP9, _DSM/_PS3/_PSC on PEGP). Refuses if another driver is attached.
+static uint32_t evalInt(IOACPIPlatformDevice *d, const char *name)
+{
+    UInt32 v = 0;
+    if (!d || d->evaluateInteger(name, &v) != kIOReturnSuccess) return ~0u;
+    return v;
+}
+
+static IOReturn nvopDsm(IOACPIPlatformDevice *pegp, uint32_t func, const uint8_t *arg3, size_t n, uint32_t *bitmap)
+{
+    static const uint8_t guid[16] = { 0xf8, 0xd8, 0x86, 0xa4, 0xda, 0x0b, 0x1b, 0x47, 0xa7, 0x2b, 0x60, 0x42, 0xa6, 0xb5, 0xbe, 0xe0 };
+    static const uint8_t zero4[4] = { 0, 0, 0, 0 };
+    OSObject *par[4] = { OSData::withBytes(guid, 16), OSNumber::withNumber(0x100ULL, 32), OSNumber::withNumber((unsigned long long)func, 32),
+                         OSData::withBytes(arg3 ? arg3 : zero4, arg3 ? n : 4) };
+    OSObject *res = nullptr;
+    IOReturn r = kIOReturnNoMemory;
+    if (par[0] && par[1] && par[2] && par[3]) r = pegp->evaluateObject("_DSM", &res, par, 4);
+    for (OSObject *o : par) if (o) o->release();
+    if (bitmap) {
+        *bitmap = ~0u;
+        if (OSData *d = OSDynamicCast(OSData, res)) { uint32_t b = 0; memcpy(&b, d->getBytesNoCopy(), d->getLength() < 4 ? d->getLength() : 4); *bitmap = b; }
+        else if (OSNumber *nn = OSDynamicCast(OSNumber, res)) *bitmap = (uint32_t)nn->unsigned64BitValue();
+    }
+    if (res) res->release();
+    return r;
+}
+
 void StrixDgpuClaim::powerOff()
 {
     IORegistryEntry *gppE = IORegistryEntry::fromPath("IOACPIPlane:/_SB/PCI0@0/GPP9@30001");
+    IORegistryEntry *pegE = IORegistryEntry::fromPath("IOACPIPlane:/_SB/PCI0@0/GPP9@30001/PEGP@0");
     IOACPIPlatformDevice *gpp = OSDynamicCast(IOACPIPlatformDevice, gppE);
-    auto sta = [&]() -> uint32_t {
-        UInt32 v = 0xff;
-        if (!gpp) return ~0u;
-        if (gpp->evaluateInteger("\\_SB.PCI0.GPP9.PG00._STA", &v) != kIOReturnSuccess && gpp->evaluateInteger("PG00._STA", &v) != kIOReturnSuccess) return ~0u;
-        return v;
-    };
+    IOACPIPlatformDevice *pegp = OSDynamicCast(IOACPIPlatformDevice, pegE);
     IOPCIDevice *aud = nullptr;
     if (OSDictionary *m = IOService::serviceMatching("IOPCIDevice")) {
         if (OSIterator *it = IOService::getMatchingServices(m)) {
@@ -259,29 +287,41 @@ void StrixDgpuClaim::powerOff()
     }
     const char *why = nullptr;
     if (!gpp) why = "no ACPI GPP9 device";
+    else if (!pegp) why = "no ACPI PEGP device";
     else if (hasForeignChild(gpu)) why = "another driver is attached to the RTX";
     else if (aud && hasForeignChild(aud)) why = "a driver is attached to the RTX audio function";
-    else if (sta() == 0) { gOff = true; gSta = 0; note("eco: RTX already off (PG00._STA 0)"); }
     else {
-        IOPCIDevice *fns[2] = { aud, gpu };
-        for (IOPCIDevice *d : fns) {
-            uint8_t pm = 0;
-            if (d && d->findPCICapability(kIOPCIPowerManagementCapability, &pm) && pm) {
-                uint16_t v = d->configRead16(pm + 4);
-                d->configWrite16(pm + 4, uint16_t((v & ~0x8003u) | 3));
+        gGstaBefore = evalInt(gpp, "GSTA");
+        if (gGstaBefore == 0) { gOff = true; gSta = 0; gGstaAfter = 0; note("eco: RTX already off (GPP9.GSTA 0)"); }
+        else {
+            uint32_t bm = 0;
+            IOReturn r0 = nvopDsm(pegp, 0, nullptr, 4, &bm);
+            IOLog("StrixDgpuGate: NVOP func0 -> %#x bitmap %#x (expect 0x04000001)\n", r0, bm);
+            static const uint8_t a3[4] = { 0x01, 0x00, 0x00, 0x03 };   // FLCH=1, OPCE=3
+            IOReturn r1 = nvopDsm(pegp, 0x1A, a3, 4, nullptr);
+            IOPCIDevice *fns[2] = { aud, gpu };
+            for (IOPCIDevice *d : fns) {
+                uint8_t pm = 0;
+                if (d && d->findPCICapability(kIOPCIPowerManagementCapability, &pm) && pm) {
+                    uint16_t v = d->configRead16(pm + 4);
+                    d->configWrite16(pm + 4, uint16_t((v & ~0x8003u) | 3));
+                }
             }
+            IOSleep(10);
+            IOReturn r2 = pegp->evaluateObject("_PS3");
+            gGstaAfter = evalInt(gpp, "GSTA");
+            gPsc = evalInt(pegp, "_PSC");
+            gVendorAfter = gpu->configRead16(0);
+            gSta = gGstaAfter;
+            gOff = gGstaAfter == 0;
+            char msg[96];
+            snprintf(msg, sizeof msg, "eco: dsm0 %#x dsm1A %#x ps3 %#x gsta %u->%u psc %u vid %#x", r0, r1, r2, (unsigned)gGstaBefore, (unsigned)gGstaAfter, (unsigned)gPsc, (unsigned)gVendorAfter);
+            note(msg);
         }
-        IOSleep(10);
-        IOReturn r = gpp->evaluateObject("\\_SB.PCI0.GPP9.PG00._OFF");
-        if (r != kIOReturnSuccess) r = gpp->evaluateObject("PG00._OFF");
-        gSta = sta();
-        gOff = gSta == 0;
-        char msg[96];
-        snprintf(msg, sizeof msg, "eco: PG00._OFF %#x, PG00._STA %u (0 = off)", r, (unsigned)gSta);
-        note(msg);
     }
     if (why) { char msg[96]; snprintf(msg, sizeof msg, "eco: power off refused: %s", why); note(msg); }
     if (gInfo) gInfo->publish();
     if (aud) aud->release();
+    if (pegE) pegE->release();
     if (gppE) gppE->release();
 }

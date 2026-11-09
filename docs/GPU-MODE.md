@@ -13,7 +13,7 @@ next boot**; there is no live switch.
   `probe()` returns null (NVRM binds as if the kext were absent) unless: Darwin 25.x, no `-strixgate_off`, mode is `eco`, or
   `optimized` and `ACPI0003._PSR == 0` at boot (unknown power source => standard), and the loop guard is clear.
 * When it claims: NVRM and everything above it never start. After 3 s it puts the RTX and its audio function in D3hot (PMCSR)
-  and evaluates `\_SB.PCI0.GPP9.PG00._OFF` (same sequence as StrixS0ix 0.1.16 `s0ix_dgpuoff`), refusing if any other driver
+  and runs the firmware Optimus path: PEGP `_DSM` (NVOP GUID, func 0x1A, Arg3 01 00 00 03 sets OMPR=3), PMCSR D3hot on both functions, PEGP `_PS3` (which runs PG00._OFF); re-run after wake if GPP9.GSTA reads 1. Published: `gsta-before`, `gsta-after`, `psc`, `vendor-after`, refusing if any other driver
   sits on either function. After a system wake it re-checks and repeats.
 * `StrixDgpuAccelHold` (IOMatchCategory IOAccelerator, score 1000) takes NVAccel's category in Eco and never registers, so NVAccel's 30 s wait for NVRM never starts. The Eco decision (incl. loop guard) is made once per boot, on the first probe of any personality.
 * Eco never uses `-nvoff` or `nullmoth-remove` (those park NMXGPU/NMXAGDC too).
@@ -34,7 +34,7 @@ when the RTX is provably held by the gate and has no other driver (`ASUS_GPF_LIV
 disabled in the UI.
 
 ## Failure modes
-* PG00._OFF untested on macOS (StrixS0ix 0.1.16 same path, also not installed): a hang or panic is possible. Guard: Eco claim sets
+* IOACPIPlatformDevice evaluate* rejects dotted paths (kIOReturnBadArgument, seen on the first real boot): every call is a single NameSeg on the owning device (GSTA on GPP9; _DSM/_PS3/_PSC on PEGP). Power-off itself is still untested end to end: a hang or panic is possible.  (StrixS0ix 0.1.16 same path, also not installed): a hang or panic is possible. Guard: Eco claim sets
   `strix-gpu-eco-try=1`, cleared after 90 s; if still 1 at the next boot the gate stands down once (RTX to NVRM) and reports `gate-tripped`. A normal
   shutdown within 90 s of an Eco boot also trips it (safe direction).
 * Gate kext missing/not loaded: Eco is stored but has no effect; the app warns and shows "StrixDgpuGate not loaded".
