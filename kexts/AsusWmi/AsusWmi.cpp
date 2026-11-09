@@ -722,7 +722,7 @@ static bool rtxForeignDriver(bool *found)
             if (OSIterator *ch = d->getChildIterator(gIOServicePlane)) {
                 while (OSObject *co = ch->getNextObject()) {
                     IOService *c2 = OSDynamicCast(IOService, co);
-                    if (c2 && !c2->isInactive() && (c2->getState() & kIOServiceRegisteredState) && strcmp(c2->getName(), "StrixDgpuClaim") != 0)
+                    if (c2 && !c2->isInactive() && (c2->getState() & kIOServiceRegisteredState) && strcmp(c2->getName(), "StrixDgpuClaim") != 0 && strcmp(c2->getName(), "StrixDgpuAccelHold") != 0)
                         foreign = true;
                 }
                 ch->release();

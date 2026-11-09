@@ -21,6 +21,16 @@
 			<key>IOPCIPrimaryMatch</key><string>0x000010de&amp;0x0000ffff</string>
 			<key>IOProbeScore</key><integer>2000</integer>
 		</dict>
+		<key>StrixDgpuAccelHold</key>
+		<dict>
+			<key>CFBundleIdentifier</key><string>com.itlmt7925.strixdgpugate</string>
+			<key>IOClass</key><string>StrixDgpuAccelHold</string>
+			<key>IOMatchCategory</key><string>IOAccelerator</string>
+			<key>IOProviderClass</key><string>IOPCIDevice</string>
+			<key>IOPCIClassMatch</key><string>0x03000000&amp;0xff000000</string>
+			<key>IOPCIPrimaryMatch</key><string>0x000010de&amp;0x0000ffff</string>
+			<key>IOProbeScore</key><integer>1000</integer>
+		</dict>
 		<key>StrixDgpuGate</key>
 		<dict>
 			<key>CFBundleIdentifier</key><string>com.itlmt7925.strixdgpugate</string>

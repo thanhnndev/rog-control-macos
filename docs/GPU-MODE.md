@@ -15,6 +15,8 @@ next boot**; there is no live switch.
 * When it claims: NVRM and everything above it never start. After 3 s it puts the RTX and its audio function in D3hot (PMCSR)
   and evaluates `\_SB.PCI0.GPP9.PG00._OFF` (same sequence as StrixS0ix 0.1.16 `s0ix_dgpuoff`), refusing if any other driver
   sits on either function. After a system wake it re-checks and repeats.
+* `StrixDgpuAccelHold` (IOMatchCategory IOAccelerator, score 1000) takes NVAccel's category in Eco and never registers, so NVAccel's 30 s wait for NVRM never starts. The Eco decision (incl. loop guard) is made once per boot, on the first probe of any personality.
+* Eco never uses `-nvoff` or `nullmoth-remove` (those park NMXGPU/NMXAGDC too).
 * Status service `StrixDgpuGate` (IOResources): `gate-effective`, `gate-held`, `gate-powered-off`, `gate-tripped`, `pg00-sta`, `gate-state`.
 * AsusWmi ABI 6: selector 6 `GpuGet` (8 words: flags, stored mode, boot mode, DSTS 0x00090020 / 0x00090016, PG00 _STA, Darwin
   major), selector 7 `GpuSet` { what, value }: 1 = store mode (always allowed on Darwin 25), 2 = WMI dGPU disable, 3 = MUX.

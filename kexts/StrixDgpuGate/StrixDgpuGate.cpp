@@ -124,29 +124,51 @@ static void note(const char *s)
     if (gInfo) gInfo->publish();
 }
 
-IOService *StrixDgpuClaim::probe(IOService *provider, SInt32 *score)
+// One decision per boot, on the first probe of any personality; every later probe (other personality, re-match) reads it.
+static bool gDecided, gEco;
+
+static bool decide()
 {
+    if (gDecided) return gEco;
+    gDecided = true;
+    gEco = false;
     gEffective = 0;
-    if (version_major != 25) { note("standard: not Darwin 25.x"); return nullptr; }
-    if (PE_parse_boot_argn("-strixgate_off", nullptr, 0)) { note("standard: -strixgate_off"); return nullptr; }
+    if (version_major != 25) { note("standard: not Darwin 25.x"); return false; }
+    if (PE_parse_boot_argn("-strixgate_off", nullptr, 0)) { note("standard: -strixgate_off"); return false; }
     char mode[16], tr[8];
     readVar(VAR_MODE, mode, sizeof mode);
     bool eco = strncmp(mode, "eco", 3) == 0;
     if (strncmp(mode, "optimized", 9) == 0) {
         bool known = false, bat = onBattery(&known);
-        if (!known) { note("standard: optimized, power source unknown"); return nullptr; }
+        if (!known) { note("standard: optimized, power source unknown"); return false; }
         eco = bat;
     }
-    if (!eco) { note("standard: NVRM drives the RTX"); return nullptr; }
+    if (!eco) { note("standard: NVRM drives the RTX"); return false; }
     readVar(VAR_TRY, tr, sizeof tr);
     if (tr[0] == '1') {          // the previous Eco boot never reached 90 s of uptime: let NVRM have the card this once
         gTripped = true;
         writeVar(VAR_TRY, "0");
         note("standard: loop guard (previous Eco boot did not finish)");
-        return nullptr;
+        return false;
     }
-    return IOService::probe(provider, score);
+    gEco = true;
+    return true;
 }
+
+IOService *StrixDgpuClaim::probe(IOService *provider, SInt32 *score)
+{
+    return decide() ? IOService::probe(provider, score) : nullptr;
+}
+
+// NVAccel matches the RTX in IOMatchCategory IOAccelerator and its start() polls for NVRM for up to 30 s. In Eco this
+// personality takes that category: it starts, never registers, so NVAccel is never probed.
+class StrixDgpuAccelHold : public IOService {
+    OSDeclareDefaultStructors(StrixDgpuAccelHold)
+public:
+    IOService *probe(IOService *provider, SInt32 *score) override { return decide() ? IOService::probe(provider, score) : nullptr; }
+    bool start(IOService *provider) override { return IOService::start(provider); }   // no registerService()
+};
+OSDefineMetaClassAndStructors(StrixDgpuAccelHold, IOService)
 
 bool StrixDgpuClaim::start(IOService *provider)
 {
@@ -206,7 +228,7 @@ static bool hasForeignChild(IOService *dev)
     if (OSIterator *it = dev->getChildIterator(gIOServicePlane)) {
         while (OSObject *o = it->getNextObject()) {
             IOService *c = OSDynamicCast(IOService, o);
-            if (c && !c->isInactive() && (c->getState() & kIOServiceRegisteredState) && strcmp(c->getName(), "StrixDgpuClaim") != 0) any = true;
+            if (c && !c->isInactive() && (c->getState() & kIOServiceRegisteredState) && strcmp(c->getName(), "StrixDgpuClaim") != 0 && strcmp(c->getName(), "StrixDgpuAccelHold") != 0) any = true;
         }
         it->release();
     }
