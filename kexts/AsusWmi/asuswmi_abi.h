@@ -5,7 +5,7 @@
 #ifndef ASUSWMI_ABI_H
 #define ASUSWMI_ABI_H
 
-#define ASUSWMI_ABI_VERSION 5
+#define ASUSWMI_ABI_VERSION 6
 
 enum {
     kAsusUcGetState  = 0,   // out: struct, uint32_t[ASUS_ST_COUNT]
@@ -16,7 +16,46 @@ enum {
     kAsusUcFanReset  = 4,   // re-applies the current profile: firmware fan curves, power limits back to the profile's
     kAsusUcKey       = 5,   // in: scalars { code }: an Fn key code from the N-KEY keyboard (HID report 0x5A), read by rogkeyd
                             //     (ABI 4); handled as a hotkey, see AsusWmi.cpp
+    kAsusUcGpuGet    = 6,   // out: struct, uint32_t[ASUS_GP_COUNT]: GPU mode state (ABI 6), see docs/GPU-MODE.md
+    kAsusUcGpuSet    = 7,   // in: scalars { what (ASUS_GPU_SET_*), value } (ABI 6)
 };
+
+// ---- GPU mode (ABI 6) -------------------------------------------------------------------------------------------------------
+// Eco = the RTX is kept away from NVRM at boot and powered off (StrixDgpuGate); there is no live switch, the stored mode
+// takes effect at the next boot. The mode lives in the NVRAM variable ASUS_GPU_NVRAM_VAR, written by this kext.
+#define ASUS_GPU_NVRAM_VAR "strix-gpu-mode"           // "standard" | "eco" | "optimized"; absent = standard
+enum {                      // the stored mode / the mode the gate resolved for this boot
+    ASUS_GPU_STANDARD  = 0, // hybrid: NVRM drives the RTX
+    ASUS_GPU_ECO       = 1, // dGPU off
+    ASUS_GPU_OPTIMIZED = 2, // Eco when the boot starts on battery, Standard on AC (decided once, at boot)
+    ASUS_GPU_ULTIMATE  = 3, // MUX to the dGPU: never selectable (the 890M stack would lose the panel); reported only
+};
+enum {                      // kAsusUcGpuSet "what"
+    ASUS_GPU_SET_MODE  = 1, // value 0..2: store the mode for the next boot (NVRAM). Always allowed.
+    ASUS_GPU_SET_DGPU  = 2, // value 0/1: WMI DEVS 0x00090020 (ACPI hot eject + EC rail). Only with the RTX provably detached from NVRM
+                            //     and the gate active; expert/test use, the app does not call it (see docs/GPU-MODE.md)
+    ASUS_GPU_SET_MUX   = 3, // value 0/1: WMI DEVS 0x00090016. Refused unless boot-arg asuswmi_mux=1 (it moves the panel to the RTX)
+};
+enum {                      // kAsusUcGpuGet words
+    ASUS_GP_ABI = 0,        // ASUSWMI_ABI_VERSION
+    ASUS_GP_FLAGS,          // ASUS_GPF_*
+    ASUS_GP_MODE,           // stored mode (ASUS_GPU_*), 0xFFFFFFFF = variable absent (Standard)
+    ASUS_GP_BOOT,           // what the gate resolved at this boot: ASUS_GPU_STANDARD / ASUS_GPU_ECO, 0xFFFFFFFF = gate not loaded
+    ASUS_GP_DGPU_DSTS,      // raw DSTS 0x00090020
+    ASUS_GP_MUX_DSTS,       // raw DSTS 0x00090016
+    ASUS_GP_PG00_STA,       // \_SB.PCI0.GPP9.PG00._STA as the gate saw it (1 on, 0 off), 0xFFFFFFFF unknown
+    ASUS_GP_DARWIN,         // Darwin major (25 = macOS 26)
+    ASUS_GP_COUNT = 8
+};
+#define ASUS_GPF_SUPPORTED   0x01u   // Darwin 25.x and the firmware reports the dGPU-disable device
+#define ASUS_GPF_GATE        0x02u   // StrixDgpuGate is loaded
+#define ASUS_GPF_GATE_HELD   0x04u   // the gate holds the RTX this boot (NVRM not attached)
+#define ASUS_GPF_POWERED_OFF 0x08u   // the gate powered the RTX off (PG00._OFF ran and PG00._STA reads 0)
+#define ASUS_GPF_NVRM        0x10u   // a driver other than the gate is attached to the RTX
+#define ASUS_GPF_NVRAM_OK    0x20u   // the mode variable can be written
+#define ASUS_GPF_TRIPPED     0x40u   // the gate refused to claim because the previous Eco boot did not finish (loop guard)
+#define ASUS_GPF_MUX_UNLOCK  0x80u   // boot-arg asuswmi_mux=1
+#define ASUS_GPF_LIVE_OK     0x100u  // the RTX is provably detached from NVRM: ASUS_GPU_SET_DGPU is allowed
 
 enum {                      // kAsusUcSet "what"
     ASUS_SET_PROFILE = 1,   // 0 balanced (Armoury Crate "Performance"), 1 turbo, 2 silent

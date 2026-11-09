@@ -55,6 +55,8 @@
 #include <IOKit/hid/IOHIDDevice.h>
 #include <IOKit/pwr_mgt/RootDomain.h>
 #include <kern/thread_call.h>
+#include <IOKit/IODeviceTreeSupport.h>
+#include <libkern/version.h>
 #include <sys/sysctl.h>
 #include <stdarg.h>
 #include <string.h>
@@ -164,6 +166,13 @@ public:
     bool battery(uint32_t out[4], char *txt, size_t txtLen);
     IOReturn ecReg();
     void findAcpi();
+    // GPU mode (ABI 6): see docs/GPU-MODE.md
+    thread_call_t nvCall = nullptr;
+    volatile int nvPending = -1;
+    int gpuStored();                                   // NVRAM mode, -1 absent
+    IOReturn gpuStore(int mode);                       // queue the NVRAM write (kernel thread: a user task may lack the privilege)
+    void gpuGet(uint32_t out[ASUS_GP_COUNT]);
+    IOReturn gpuSet(int what, int v);
 };
 OSDefineMetaClassAndStructors(AsusWmi, IOService)
 
@@ -637,6 +646,160 @@ IOReturn AsusWmi::fanReset()
     return setValue(ASUS_SET_PROFILE, curProfile >= 0 ? curProfile : 0);
 }
 
+// ---------------------------------------------------------------------------------------------------------------------------
+// GPU mode (ABI 6)
+// ---------------------------------------------------------------------------------------------------------------------------
+static const char *const kGpuNames[3] = { "standard", "eco", "optimized" };
+
+static IORegistryEntry *optionsEntry() { return IORegistryEntry::fromPath("/options", gIODTPlane); }
+
+int AsusWmi::gpuStored()
+{
+    int mode = -1;
+    if (IORegistryEntry *o = optionsEntry()) {
+        OSObject *v = o->getProperty(ASUS_GPU_NVRAM_VAR);
+        const char *txt = nullptr;
+        char buf[16] = {0};
+        if (OSString *str = OSDynamicCast(OSString, v)) txt = str->getCStringNoCopy();
+        else if (OSData *d = OSDynamicCast(OSData, v)) {
+            unsigned n = d->getLength() < sizeof(buf) - 1 ? d->getLength() : (unsigned)sizeof(buf) - 1;
+            memcpy(buf, d->getBytesNoCopy(), n);
+            txt = buf;
+        }
+        if (txt) for (int i = 0; i < 3; i++) if (strncmp(txt, kGpuNames[i], strlen(kGpuNames[i])) == 0) mode = i;
+        o->release();
+    }
+    return mode;
+}
+
+static void nvWrite(thread_call_param_t self, thread_call_param_t)
+{
+    AsusWmi *me = static_cast<AsusWmi *>(self);
+    int mode = me->nvPending;
+    if (mode < 0 || mode > 2) return;
+    IORegistryEntry *o = optionsEntry();
+    if (!o) { IOLog("AsusWmi: gpu mode: no /options\n"); return; }
+    OSString *str = OSString::withCString(kGpuNames[mode]);
+    if (str) {
+        bool ok = o->setProperty(ASUS_GPU_NVRAM_VAR, str);
+        str->release();
+        OSString *key = OSString::withCString(ASUS_GPU_NVRAM_VAR);
+        if (key) { o->setProperty("IONVRAM-FORCESYNCNOW-PROPERTY", key); key->release(); }   // flush now: no reboot window to lose it
+        IOLog("AsusWmi: gpu mode %s stored (%s)\n", kGpuNames[mode], ok ? "ok" : "refused");
+    }
+    o->release();
+}
+
+IOReturn AsusWmi::gpuStore(int mode)
+{
+    if (mode < 0 || mode > 2) return kIOReturnBadArgument;
+    if (version_major != 25) return kIOReturnUnsupported;
+    if (!nvCall) return kIOReturnNotReady;
+    nvPending = mode;
+    thread_call_enter(nvCall);
+    say("gpu mode %s queued", kGpuNames[mode]);
+    return kIOReturnSuccess;
+}
+
+// the RTX: IOPCIDevice vendor 10de, class 03; "foreign" = a registered child that is not our gate
+static bool rtxForeignDriver(bool *found)
+{
+    bool foreign = false;
+    *found = false;
+    OSDictionary *m = IOService::serviceMatching("IOPCIDevice");
+    if (!m) return false;
+    if (OSIterator *it = IOService::getMatchingServices(m)) {
+        while (OSObject *o = it->getNextObject()) {
+            IOService *d = OSDynamicCast(IOService, o);
+            OSData *ven = d ? OSDynamicCast(OSData, d->getProperty("vendor-id")) : nullptr;
+            OSData *cls = d ? OSDynamicCast(OSData, d->getProperty("class-code")) : nullptr;
+            if (!ven || !cls || ven->getLength() < 4 || cls->getLength() < 4) continue;
+            uint32_t v, c;
+            memcpy(&v, ven->getBytesNoCopy(), 4);
+            memcpy(&c, cls->getBytesNoCopy(), 4);
+            if ((v & 0xffff) != 0x10de || (c >> 16) != 0x03) continue;
+            *found = true;
+            if (OSIterator *ch = d->getChildIterator(gIOServicePlane)) {
+                while (OSObject *co = ch->getNextObject()) {
+                    IOService *c2 = OSDynamicCast(IOService, co);
+                    if (c2 && !c2->isInactive() && (c2->getState() & kIOServiceRegisteredState) && strcmp(c2->getName(), "StrixDgpuClaim") != 0)
+                        foreign = true;
+                }
+                ch->release();
+            }
+        }
+        it->release();
+    }
+    m->release();
+    return foreign;
+}
+
+static uint32_t gateNum(IOService *g, const char *k)
+{
+    OSNumber *n = OSDynamicCast(OSNumber, g->getProperty(k));
+    return n ? n->unsigned32BitValue() : ~0u;
+}
+
+void AsusWmi::gpuGet(uint32_t out[ASUS_GP_COUNT])
+{
+    memset(out, 0, ASUS_GP_COUNT * sizeof(uint32_t));
+    uint32_t v = 0, f = 0;
+    out[ASUS_GP_ABI] = ASUSWMI_ABI_VERSION;
+    out[ASUS_GP_DARWIN] = (uint32_t)version_major;
+    out[ASUS_GP_DGPU_DSTS] = dsts(DEV_DGPU, &v) ? v : ~0u;
+    out[ASUS_GP_MUX_DSTS] = dsts(DEV_GPU_MUX, &v) ? v : ~0u;
+    if (version_major == 25 && out[ASUS_GP_DGPU_DSTS] != ~0u && (out[ASUS_GP_DGPU_DSTS] & DSTS_PRESENT)) f |= ASUS_GPF_SUPPORTED;
+    int st = gpuStored();
+    out[ASUS_GP_MODE] = st < 0 ? ~0u : (uint32_t)st;
+    out[ASUS_GP_BOOT] = ~0u;
+    out[ASUS_GP_PG00_STA] = ~0u;
+    bool held = false;
+    if (OSDictionary *m = IOService::serviceMatching("StrixDgpuGate")) {
+        IOService *g = IOService::copyMatchingService(m);
+        m->release();
+        if (g) {
+            f |= ASUS_GPF_GATE;
+            held = g->getProperty("gate-held") == kOSBooleanTrue;
+            if (held) f |= ASUS_GPF_GATE_HELD;
+            if (g->getProperty("gate-powered-off") == kOSBooleanTrue) f |= ASUS_GPF_POWERED_OFF;
+            if (g->getProperty("gate-tripped") == kOSBooleanTrue) f |= ASUS_GPF_TRIPPED;
+            out[ASUS_GP_BOOT] = gateNum(g, "gate-effective");
+            out[ASUS_GP_PG00_STA] = gateNum(g, "pg00-sta");
+            g->release();
+        }
+    }
+    bool found = false, foreign = rtxForeignDriver(&found);
+    if (foreign) f |= ASUS_GPF_NVRM;
+    if (IORegistryEntry *o = optionsEntry()) { f |= ASUS_GPF_NVRAM_OK; o->release(); }
+    uint32_t mux = 0;
+    if (PE_parse_boot_argn("asuswmi_mux", &mux, sizeof mux) && mux == 1) f |= ASUS_GPF_MUX_UNLOCK;
+    if (held && !foreign && found && version_major == 25) f |= ASUS_GPF_LIVE_OK;
+    out[ASUS_GP_FLAGS] = f;
+}
+
+IOReturn AsusWmi::gpuSet(int what, int v)
+{
+    uint32_t g[ASUS_GP_COUNT], ret = 0;
+    switch (what) {
+    case ASUS_GPU_SET_MODE:
+        return gpuStore(v);
+    case ASUS_GPU_SET_DGPU:
+        if (v < 0 || v > 1) return kIOReturnBadArgument;
+        gpuGet(g);
+        if (!(g[ASUS_GP_FLAGS] & ASUS_GPF_LIVE_OK)) return kIOReturnNotPermitted;   // NVRM may still own the card
+        say("gpu: dgpu_disable=%d (live, RTX held by the gate)", v);
+        return devs(DEV_DGPU, (uint32_t)v, &ret) ? kIOReturnSuccess : kIOReturnIOError;
+    case ASUS_GPU_SET_MUX:
+        if (v < 0 || v > 1) return kIOReturnBadArgument;
+        gpuGet(g);
+        if (!(g[ASUS_GP_FLAGS] & ASUS_GPF_SUPPORTED) || !(g[ASUS_GP_FLAGS] & ASUS_GPF_MUX_UNLOCK)) return kIOReturnNotPermitted;
+        say("gpu: mux=%d (asuswmi_mux=1)", v);
+        return devs(DEV_GPU_MUX, (uint32_t)v, &ret) ? kIOReturnSuccess : kIOReturnIOError;
+    default:
+        return kIOReturnUnsupported;
+    }
+}
+
 void AsusWmi::getState(uint32_t st[ASUS_ST_COUNT])
 {
     memset(st, 0, ASUS_ST_COUNT * sizeof(uint32_t));
@@ -773,6 +936,22 @@ IOReturn AsusWmiUC::externalMethod(uint32_t selector, IOExternalMethodArguments 
         if (a->scalarInputCount != 1 || a->scalarInput[0] == 0 || a->scalarInput[0] > 0xFF) return kIOReturnBadArgument;
         drv->keyQueue((uint32_t)a->scalarInput[0] | 0x100);
         return kIOReturnSuccess;
+    case kAsusUcGpuGet: {
+        if (!a->structureOutput || a->structureOutputSize < ASUS_GP_COUNT * sizeof(uint32_t)) return kIOReturnBadArgument;
+        uint32_t g[ASUS_GP_COUNT];
+        IOLockLock(drv->lock);
+        drv->gpuGet(g);
+        IOLockUnlock(drv->lock);
+        memcpy(a->structureOutput, g, sizeof(g));
+        a->structureOutputSize = sizeof(g);
+        return kIOReturnSuccess;
+    }
+    case kAsusUcGpuSet:
+        if (a->scalarInputCount != 2) return kIOReturnBadArgument;
+        IOLockLock(drv->lock);
+        r = drv->gpuSet((int)a->scalarInput[0], (int)a->scalarInput[1]);
+        IOLockUnlock(drv->lock);
+        return r;
     case kAsusUcFanReset:
         IOLockLock(drv->lock);
         r = drv->fanReset();
@@ -841,7 +1020,7 @@ static int hotkey_sysctl SYSCTL_HANDLER_ARGS
     return SYSCTL_OUT(req, value, strlen(value) + 1);
 }
 
-enum { W_DUMP = 100, W_FAN_CUSTOM = 101, W_EC_REG = 102, W_KEY = 103 };
+enum { W_DUMP = 100, W_FAN_CUSTOM = 101, W_EC_REG = 102, W_KEY = 103, W_GPU_MODE = 104 };
 
 static int write_sysctl SYSCTL_HANDLER_ARGS
 {
@@ -859,6 +1038,7 @@ static int write_sysctl SYSCTL_HANDLER_ARGS
     else if (what == ASUS_SET_SLASH) v = (int)gSelf->slashSet;
     else if (what == ASUS_SET_AURA) v = gSelf->auraMode;
     else if (what == W_KEY) v = (int)gSelf->lastKey;
+    else if (what == W_GPU_MODE) v = gSelf->gpuStored();
     IOLockUnlock(gSelf->lock);
     int e = sysctl_handle_int(oidp, &v, 0, req);
     if (e || !req->newptr) return e;
@@ -869,6 +1049,7 @@ static int write_sysctl SYSCTL_HANDLER_ARGS
     else if (what == W_EC_REG) r = v ? gSelf->ecReg() : kIOReturnSuccess;
     else if (what == W_KEY) { uint32_t ret = 0; r = v > 0 && v < 0x100 && gSelf->devs(DEV_HOTKEY, (uint32_t)v, &ret) ? kIOReturnSuccess : kIOReturnBadArgument;
                               gSelf->say("hotkey %02x emulated -> %08x", v, ret); }
+    else if (what == W_GPU_MODE) r = gSelf->gpuStore(v);
     else r = gSelf->setValue(what, v);
     IOLockUnlock(gSelf->lock);
     switch (r) {
@@ -925,6 +1106,7 @@ SYSCTL_PROC(_debug_asuswmi, OID_AUTO, ec_reg, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG
 SYSCTL_PROC(_debug_asuswmi, OID_AUTO, kbd, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, ASUS_SET_KBD, write_sysctl, "I", "");
 SYSCTL_PROC(_debug_asuswmi, OID_AUTO, aura, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, ASUS_SET_AURA, write_sysctl, "I", "");
 SYSCTL_PROC(_debug_asuswmi, OID_AUTO, slash, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, ASUS_SET_SLASH, write_sysctl, "I", "");
+SYSCTL_PROC(_debug_asuswmi, OID_AUTO, gpu_mode, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, W_GPU_MODE, write_sysctl, "I", "stored GPU mode 0 standard 1 eco 2 optimized (next boot)");
 SYSCTL_PROC(_debug_asuswmi, OID_AUTO, key, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, W_KEY, write_sysctl, "I", "");
 
 static struct sysctl_oid *const kOids[] = {
@@ -932,7 +1114,7 @@ static struct sysctl_oid *const kOids[] = {
     &sysctl__debug_asuswmi_ppt_spl, &sysctl__debug_asuswmi_ppt_sppt, &sysctl__debug_asuswmi_ppt_fppt,
     &sysctl__debug_asuswmi_charge_limit, &sysctl__debug_asuswmi_dumpacpi, &sysctl__debug_asuswmi_probe,
     &sysctl__debug_asuswmi_backlight, &sysctl__debug_asuswmi_battery, &sysctl__debug_asuswmi_ec_reg,
-    &sysctl__debug_asuswmi_kbd, &sysctl__debug_asuswmi_aura, &sysctl__debug_asuswmi_slash, &sysctl__debug_asuswmi_key,
+    &sysctl__debug_asuswmi_kbd, &sysctl__debug_asuswmi_aura, &sysctl__debug_asuswmi_slash, &sysctl__debug_asuswmi_key, &sysctl__debug_asuswmi_gpu_mode,
 };
 
 bool AsusWmi::start(IOService *provider)
@@ -951,6 +1133,7 @@ bool AsusWmi::start(IOService *provider)
     evCall = thread_call_allocate(evThread, this);
     if (evCall) atkNotifier = atk->registerInterest(gIOGeneralInterest, atkNotify, this);
     say("hotkeys %s", atkNotifier ? "hooked" : "not hooked");
+    nvCall = thread_call_allocate(nvWrite, this);
     keyQLock = IOSimpleLockAlloc();
     keyCall = keyQLock ? thread_call_allocate(keyThread, this) : nullptr;
     char bt[256];
@@ -969,6 +1152,7 @@ void AsusWmi::stop(IOService *provider)
     for (int i = (int)(sizeof(kOids) / sizeof(kOids[0])) - 1; i >= 0; i--) sysctl_unregister_oid(kOids[i]);
     if (atkNotifier) { atkNotifier->remove(); atkNotifier = nullptr; }
     if (evCall) { thread_call_cancel_wait(evCall); thread_call_free(evCall); evCall = nullptr; }
+    if (nvCall) { thread_call_cancel_wait(nvCall); thread_call_free(nvCall); nvCall = nullptr; }
     if (keyCall) { thread_call_cancel_wait(keyCall); thread_call_free(keyCall); keyCall = nullptr; }
     if (keyQLock) { IOSimpleLockFree(keyQLock); keyQLock = nullptr; }
     gSelf = nullptr;

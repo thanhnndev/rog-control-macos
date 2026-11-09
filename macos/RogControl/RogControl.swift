@@ -38,6 +38,26 @@ struct AsusState {
     var aura: Int? = nil, hasAura = false                                   // ABI 5: keyboard Aura mode 0..2
 }
 
+// GPU mode (asuswmi_abi.h ABI 6, docs/GPU-MODE.md). Eco / Optimized take effect at the next boot.
+struct GpuState {
+    var present = false
+    var flags: UInt32 = 0
+    var stored: Int? = nil              // 0 standard, 1 eco, 2 optimized; nil = never set (Standard)
+    var boot: Int? = nil                // what StrixDgpuGate resolved at this boot (0 / 1); nil = gate not loaded
+    var dgpuDsts: UInt32 = ~0, muxDsts: UInt32 = ~0, pg00: UInt32 = ~0
+    var darwin = 0
+    var supported: Bool { flags & 0x01 != 0 }
+    var gate: Bool { flags & 0x02 != 0 }
+    var held: Bool { flags & 0x04 != 0 }
+    var poweredOff: Bool { flags & 0x08 != 0 }
+    var nvramOK: Bool { flags & 0x20 != 0 }
+    var tripped: Bool { flags & 0x40 != 0 }
+    var mode: Int { stored ?? 0 }
+    /// 1 when this power source asks for Eco, 0 otherwise (Optimized: Eco on battery)
+    func wanted(ac: Bool) -> Int { mode == 1 ? 1 : mode == 2 ? (ac ? 0 : 1) : 0 }
+    func restartRequired(ac: Bool) -> Bool { present && supported && (boot ?? 0) != wanted(ac: ac) }
+}
+
 // Slash lighting (asuswmi_abi.h ASUS_SLASH_*): mode index, brightness 0..3 (0 = off), interval 0..5
 struct Slash: Equatable {
     static let modes = ["Static", "Bounce", "Slash", "Loading", "Bit Stream", "Transmission", "Flow", "Flux",
@@ -49,8 +69,8 @@ struct Slash: Equatable {
 }
 
 enum Asus {
-    static let abi: UInt32 = 5                                    // ABI 4 added the key selector, ABI 5 the Aura word and setting
-    enum Sel: UInt32 { case state = 0, set = 1, fanRead = 2, fanWrite = 3, fanReset = 4 }
+    static let abi: UInt32 = 6                                    // ABI 4 added the key selector, ABI 5 the Aura word and setting
+    enum Sel: UInt32 { case state = 0, set = 1, fanRead = 2, fanWrite = 3, fanReset = 4, key = 5, gpuGet = 6, gpuSet = 7 }
     enum What: UInt64 { case profile = 1, spl = 2, sppt = 3, fppt = 4, charge = 5, backlight = 6, kbd = 7, slash = 8, aura = 9 }
 
     static func open() -> io_connect_t? {
@@ -104,6 +124,17 @@ enum Asus {
         return s
     }
 
+    static func gpu() -> GpuState {
+        var g = GpuState()
+        let (kr, b) = call(.gpuGet, outCount: 8 * 4)
+        guard kr == KERN_SUCCESS, b.count >= 8 * 4 else { return g }
+        func w(_ i: Int) -> UInt32 { b.withUnsafeBytes { $0.load(fromByteOffset: i * 4, as: UInt32.self) } }
+        g.present = true; g.flags = w(1)
+        g.stored = w(2) == ~0 ? nil : Int(w(2)); g.boot = w(3) == ~0 ? nil : Int(w(3))
+        g.dgpuDsts = w(4); g.muxDsts = w(5); g.pg00 = w(6); g.darwin = Int(w(7))
+        return g
+    }
+    @discardableResult static func setGpuMode(_ mode: Int) -> kern_return_t { call(.gpuSet, scalars: [1, UInt64(mode)]).0 }
     @discardableResult static func set(_ what: What, _ v: Int) -> kern_return_t { call(.set, scalars: [what.rawValue, UInt64(v)]).0 }
     static func fanCurve(fan: Int, profile: Int) -> [UInt8]? {
         let (kr, b) = call(.fanRead, scalars: [UInt64(fan), UInt64(profile)], outCount: 16)
@@ -381,6 +412,8 @@ final class RogModel: ObservableObject {
     @Published var kbd = UserDefaults.standard.object(forKey: "kbd") == nil ? 2 : UserDefaults.standard.integer(forKey: "kbd")
     @Published var slash = UserDefaults.standard.object(forKey: "slash") == nil ? Slash() : Slash(packed: UserDefaults.standard.integer(forKey: "slash"))
     @Published var message = ""
+    @Published var gpu = GpuState()
+    @Published var gpuError = ""
     @Published var loginEnabled = LoginItem.enabled
     @Published var curve: [UInt8]? = nil
     @Published var gpuCurve: [UInt8]? = nil
@@ -430,6 +463,7 @@ final class RogModel: ObservableObject {
 
     init() {
         refresh()
+        gpu = Asus.gpu()
         // first run: keep what the firmware is doing now instead of imposing a default
         let d = UserDefaults.standard
         if st.present, d.string(forKey: st.ac ? "ac.mode" : "battery.mode") == nil, let m = Mode.from(profile: st.profile) {
@@ -494,9 +528,18 @@ final class RogModel: ObservableObject {
         lastAC = st.ac
         if previousMode != activeMode { loadCurve() }
         if !preview { sound = Sound.state() }
+        if !preview, visible { gpu = Asus.gpu() }      // the window only; a plain read, nothing is written
         doctorTick += 1
         if !preview, visible, doctorTick % 15 == 0 || doctor.isEmpty { runDoctor() }   // every 30 s while the window shows
         onChange?()
+    }
+
+    func setGpuMode(_ mode: Int) {
+        guard gpu.present, gpu.supported, gpu.nvramOK else { gpuError = "GPU mode needs AsusWmi 0.3.0 (ABI 6) on macOS 26."; return }
+        if mode != 0, !gpu.gate { gpuError = "StrixDgpuGate is not installed: the setting is stored but Eco will not take effect." } else { gpuError = "" }
+        if Asus.setGpuMode(mode) != KERN_SUCCESS { gpuError = "The GPU mode was not stored."; return }
+        gpu.stored = mode; message = "GPU mode stored for the next restart"
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { MainActor.assumeIsolated { [weak self] in self?.gpu = Asus.gpu() } }
     }
 
     func powerChanged() {
@@ -1256,6 +1299,7 @@ struct RogWindowView: View {
                 MicCameraTile(m: m)
             }
             .fixedSize(horizontal: false, vertical: true)
+            GpuTile(m: m).fixedSize(horizontal: false, vertical: true)
         }
         .padding(.horizontal, 18).padding(.bottom, 18)
         .frame(width: 1120, alignment: .topLeading)
@@ -1451,6 +1495,60 @@ extension RogModel {
         if st.batState & 2 != 0 { return "Charging" + (st.batRate > 0 ? ", \(st.batRate) mA" : "") }
         if st.batState & 1 != 0 { return "On battery" + (st.batRate > 0 ? ", \(st.batRate) mA" : "") }
         return st.ac ? "Holding\(limit)" : "On battery"
+    }
+}
+
+struct GpuTile: View {
+    @ObservedObject var m: RogModel
+    static let modes: [(String, String, String)] = [
+        ("Eco", "leaf.fill", "RTX off. Best battery life. The HDMI port is wired to the RTX and stops working."),
+        ("Standard", "square.split.2x1.fill", "Hybrid: the RTX is on and drives the HDMI port."),
+        ("Optimized", "bolt.badge.automatic.fill", "Eco when the computer starts on battery, Standard when it starts on the charger."),
+    ]
+    var order: [Int] { [1, 0, 2] }          // Eco, Standard, Optimized as in G-Helper (stored values: 0 standard, 1 eco, 2 optimized)
+    var body: some View {
+        let g = m.gpu
+        let usable = g.present && g.supported && g.nvramOK
+        Card(pad: 14) {
+            TileHead(title: "GPU mode")
+            HStack(spacing: 8) {
+                ForEach(order, id: \.self) { v in
+                    let info = Self.modes[v == 1 ? 0 : v == 0 ? 1 : 2]
+                    Button { m.setGpuMode(v) } label: {
+                        VStack(spacing: 4) {
+                            Image(systemName: info.1).font(.system(size: 14))
+                            Text(info.0).font(.system(size: 12, weight: g.mode == v ? .semibold : .regular))
+                        }
+                        .frame(maxWidth: .infinity).frame(height: 52)
+                    }
+                    .buttonStyle(RogButtonStyle(selected: g.mode == v, cut: 8))
+                    .help(info.2).accessibilityLabel("GPU mode \(info.0)").accessibilityAddTraits(g.mode == v ? .isSelected : [])
+                }
+                VStack(spacing: 4) {
+                    Image(systemName: "bolt.fill").font(.system(size: 14))
+                    Text("Ultimate").font(.system(size: 12))
+                }
+                .frame(maxWidth: .infinity).frame(height: 52).foregroundStyle(T.faint).opacity(0.6)
+                .background(T.raised.opacity(0.5), in: Chamfer(cut: 8))
+                .help("Not available: Ultimate sends the panel to the RTX, and this Mac draws the desktop on the Radeon 890M.")
+                .accessibilityLabel("GPU mode Ultimate, not available")
+            }
+            .padding(.top, 8).disabled(!usable).opacity(usable ? 1 : 0.5)
+            Text(status(g)).font(.system(size: 11)).foregroundStyle(T.dim).padding(.top, 8)
+            if g.restartRequired(ac: m.st.ac) {
+                Label("Restart required: the computer started in \((g.boot ?? 0) == 1 ? "Eco" : "Standard"), \(g.wanted(ac: m.st.ac) == 1 ? "Eco" : "Standard") is selected.",
+                      systemImage: "arrow.clockwise.circle.fill").font(.system(size: 11, weight: .semibold)).foregroundStyle(T.amber).padding(.top, 4)
+            }
+            ErrorLine(text: m.gpuError).padding(.top, 4)
+        }
+    }
+    func status(_ g: GpuState) -> String {
+        if !g.present { return "GPU mode needs AsusWmi 0.3.0 (ABI 6)." }
+        if !g.supported { return "GPU mode is not available on this system (needs macOS 26 and the firmware's dGPU switch)." }
+        if g.tripped { return "The last Eco start did not finish, so this start kept the RTX on. Choose Eco again to retry." }
+        let now = g.held ? (g.poweredOff ? "RTX off" : "RTX held away from the driver, power-off pending") : g.gate ? "RTX on" : "RTX on (StrixDgpuGate not loaded)"
+        let how = g.mode == 2 ? " Optimized: this start was on \(g.boot == 1 ? "battery" : "the charger")." : ""
+        return "Now: \(now). Changes apply after a restart.\(how)"
     }
 }
 
@@ -2669,6 +2767,7 @@ enum Snapshot {
                          curve: [43, 68, 70, 72, 74, 76, 78, 255, 1, 6, 8, 13, 18, 22, 32, 32],
                          gpuCurve: [43, 67, 68, 70, 70, 70, 70, 255, 1, 6, 8, 13, 18, 22, 32, 32])
         if manual { m.settings.mode = .manual }
+        m.gpu = GpuState(present: true, flags: 0x01 | 0x02 | 0x20, stored: 1, boot: 0, dgpuDsts: 0x10000, muxDsts: 0x10000, pg00: 1, darwin: 25)
         let rogOut = AudioDevice(id: 71, uid: Sound.speakersUID, name: "ROG Speakers", builtin: false)
         m.sound = SoundState(outputs: [rogOut, AudioDevice(id: 92, uid: "builtin", name: "Built-in Output", builtin: true)],
                              output: rogOut, input: AudioDevice(id: 47, uid: Sound.micUID, name: "ROG Clear Mic", builtin: false),
