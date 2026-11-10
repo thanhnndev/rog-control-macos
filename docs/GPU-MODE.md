@@ -75,6 +75,26 @@ What happens (from the DSDT; IOPCIFamily source was not available, so its part i
 * Test (owner starts): `ioreg -c StrixDgpuGate` before and after one sleep: `gate-powered-off Yes`, `pg00-sta 0`, `vendor-after`; then
   `log show --predicate 'eventMessage contains "StrixDgpuGate"'` for the wake line.
 
+## AC-change heartbeat (trace instrumentation, StrixDgpuGate)
+
+Why: plugging the charger in hard-hung an Eco boot 8 s after AC came in (2026-11-10 09:14), no panic. Cause not proven.
+
+* Triggers (Eco claim only): Notify on ACAD (ACPI0003, `kIOACPIMessageDeviceNotification`) and a 1 Hz poll of `AppleSmartBattery.ExternalConnected`
+  (a registry property read, no AML). `kIOPMMessageSystemPowerEventOccurred` is a thermal message, not used. First source wins, shown in `hb-src`.
+* Run: 80 ticks x 250 ms. Per tick: ms since event, tick n, GPP9 `GSTA` (every tick), PEGP vendor id + PMCSR (config reads) and `_PSC` every 4th
+  tick. No config read while GSTA = 0 and the vendor is already 0xffff.
+* NVRAM `strix-gpu-hb`: one variable, rewritten every tick with the last 8 samples (no sync). Forced sync at the event, every
+  `strix-gpu-hb-sync` ticks (NVRAM var, default 8 = 2 s, 0 = only start and end) and at the end.
+  Survival: without the forced sync the write stays in the in-memory NVRAM image and a hard hang loses it; the forced sync is the same
+  call the loop guard uses and it survived a forced restart. So after a hang you get the last synced window (up to 2 s old). If the forced sync
+  itself were the stall, set `strix-gpu-hb-sync=0` (event + end only) and compare. A RAM buffer does not survive a power-button restart.
+* Live properties on the IOResources service: `hb-ring` (last 32 samples), `hb-events`, `hb-src`, `hb-ac`, `hb-ticks`, `hb-gsta-flips`,
+  `hb-first-flip-ms` (ms after the event when GSTA first went 0 -> 1: the EC/SMU re-power hypothesis), `hb-max-gap-ms` (largest gap between
+  ticks: a stall detector).
+* Does the EC flip GSTA on its own? By the AML: `GSTA` reads a chipset root-port bit (`M009(REST)` at NBIO `M084+0x1502`), the
+  bridge reset line that `BPGN/POFF` drive, not an EC register. The EC only switches the rail (`VGAT`). So GSTA 0 -> 1 means the chipset
+  side re-released the reset, not just the EC; `hb-first-flip-ms` will tell. Not observable from the DSL alone.
+
 ## Install batch (for the main session, after owner OK)
 Builds (this tree, `MACKERNELSDK=…/ga403wm-hackintosh/build/MacKernelSDK scripts/build.sh AsusWmi StrixDgpuGate`, `scripts/build-rogcontrol.sh`):
 * StrixDgpuGate 8b33c13: UUID D48A1ED0-8111-33B7-AEDB-4EF1113343C8 (already installed, OC Kernel Add #47)

@@ -26,6 +26,8 @@
 #include <IOKit/pwr_mgt/RootDomain.h>
 #include <kern/thread_call.h>
 #include <libkern/version.h>
+#include <kern/clock.h>
+#include <libkern/OSAtomic.h>
 #include <string.h>
 
 #define VAR_MODE "strix-gpu-mode"
@@ -36,6 +38,14 @@ static bool gHeld, gOff, gTripped, gDry;
 static int gEffective = 0;
 static uint32_t gSta = ~0u, gGstaBefore = ~0u, gGstaAfter = ~0u, gPsc = ~0u, gVendorAfter = ~0u;
 static char gState[96] = "not probed";
+// power-source heartbeat (see hbTick): last 32 samples, event counters
+#define HB_RING 32
+#define HB_TICKS 80                 // 80 x 250 ms = 20 s
+static char gRing[HB_RING][44];
+static uint32_t gRingN, gHbEvents, gHbFlips, gHbFirstFlipMs = ~0u, gHbMaxGapMs, gHbLastN;
+static char gHbSrc[16] = "none";
+static int gHbAc = -1;
+static volatile SInt32 gHbRunning;
 class StrixDgpuGate;
 static StrixDgpuGate *gInfo;
 
@@ -57,12 +67,12 @@ static bool readVar(const char *k, char *out, size_t n)
     return out[0] != 0;
 }
 
-static void writeVar(const char *k, const char *val)        // from a kernel thread only
+static void writeVar(const char *k, const char *val, bool sync = true)   // from a kernel thread only
 {
     IORegistryEntry *o = opts();
     if (!o) return;
     if (OSString *s = OSString::withCString(val)) { o->setProperty(k, s); s->release(); }
-    if (OSString *key = OSString::withCString(k)) { o->setProperty("IONVRAM-FORCESYNCNOW-PROPERTY", key); key->release(); }
+    if (sync) if (OSString *key = OSString::withCString(k)) { o->setProperty("IONVRAM-FORCESYNCNOW-PROPERTY", key); key->release(); }
     o->release();
 }
 
@@ -100,6 +110,25 @@ public:
         if (gPsc != ~0u) setProperty("psc", (unsigned long long)gPsc, 32);
         if (gVendorAfter != ~0u) setProperty("vendor-after", (unsigned long long)gVendorAfter, 32);
         setProperty("gate-state", gState);
+        setProperty("hb-events", (unsigned long long)gHbEvents, 32);
+        setProperty("hb-src", gHbSrc);
+        setProperty("hb-ac", (unsigned long long)(gHbAc < 0 ? 0xff : gHbAc), 32);
+        setProperty("hb-ticks", (unsigned long long)gHbLastN, 32);
+        setProperty("hb-gsta-flips", (unsigned long long)gHbFlips, 32);
+        if (gHbFirstFlipMs != ~0u) setProperty("hb-first-flip-ms", (unsigned long long)gHbFirstFlipMs, 32);
+        setProperty("hb-max-gap-ms", (unsigned long long)gHbMaxGapMs, 32);
+    }
+    void publishRing()
+    {
+        if (OSArray *a = OSArray::withCapacity(HB_RING)) {
+            uint32_t n = gRingN < HB_RING ? gRingN : HB_RING;
+            for (uint32_t i = 0; i < n; i++) {
+                uint32_t idx = (gRingN - n + i) % HB_RING;
+                if (OSString *e = OSString::withCString(gRing[idx])) { a->setObject(e); e->release(); }
+            }
+            setProperty("hb-ring", a);
+            a->release();
+        }
     }
 };
 OSDefineMetaClassAndStructors(StrixDgpuGate, IOService)
@@ -114,6 +143,22 @@ public:
     thread_call_t offCall = nullptr, tryCall = nullptr;
     IONotifier *wake = nullptr;
     IOPCIDevice *gpu = nullptr;
+    // heartbeat
+    thread_call_t hbCall = nullptr, pollCall = nullptr;
+    IONotifier *acadNote = nullptr;
+    IOACPIPlatformDevice *hbGpp = nullptr, *hbPegp = nullptr;
+    IOService *batt = nullptr;
+    int battLast = -1;
+    uint8_t pmCap = 0;
+    bool pmCapDone = false;
+    uint64_t hbT0 = 0, hbPrev = 0;
+    uint32_t hbN = 0, hbSync = 8, hbLastG = ~0u, hbVendor = ~0u, hbPmcsr = ~0u, hbPsc = ~0u;
+    void hbTrigger(const char *src);
+    void hbSample();
+    void hbBattPoll();
+    static void hbThread(thread_call_param_t self, thread_call_param_t) { static_cast<StrixDgpuClaim *>(self)->hbSample(); }
+    static void pollThread(thread_call_param_t self, thread_call_param_t) { static_cast<StrixDgpuClaim *>(self)->hbBattPoll(); }
+    static IOReturn acadMsg(void *target, void *ref, UInt32 type, IOService *, void *, vm_size_t);
     static void offThread(thread_call_param_t self, thread_call_param_t);
     static void clearTry(thread_call_param_t, thread_call_param_t) { writeVar(VAR_TRY, "0"); }
     static IOReturn pmMsg(void *target, void *ref, UInt32 type, IOService *, void *, vm_size_t);
@@ -189,6 +234,13 @@ bool StrixDgpuClaim::start(IOService *provider)
     uint64_t dl;
     if (tryCall) { clock_interval_to_deadline(90, kSecondScale, &dl); thread_call_enter_delayed(tryCall, dl); }
     if (IOPMrootDomain *rd = getPMRootDomain()) wake = rd->registerInterest(gIOGeneralInterest, &StrixDgpuClaim::pmMsg, this);
+    hbCall = thread_call_allocate(&StrixDgpuClaim::hbThread, this);
+    pollCall = thread_call_allocate(&StrixDgpuClaim::pollThread, this);
+    if (OSDictionary *am = IOService::nameMatching("ACPI0003")) {
+        if (IOService *ac = IOService::copyMatchingService(am)) { acadNote = ac->registerInterest(gIOGeneralInterest, &StrixDgpuClaim::acadMsg, this); ac->release(); }
+        am->release();
+    }
+    if (pollCall) { clock_interval_to_deadline(1000, kMillisecondScale, &dl); thread_call_enter_delayed(pollCall, dl); }
     if (gDry) note("eco: RTX held away from NVRM, dry run (no power off)");
     else {
         note("eco: RTX held away from NVRM, power off in 3 s");
@@ -200,6 +252,12 @@ bool StrixDgpuClaim::start(IOService *provider)
 void StrixDgpuClaim::stop(IOService *provider)
 {
     if (wake) { wake->remove(); wake = nullptr; }
+    if (acadNote) { acadNote->remove(); acadNote = nullptr; }
+    if (pollCall) { thread_call_cancel_wait(pollCall); thread_call_free(pollCall); pollCall = nullptr; }
+    if (hbCall) { thread_call_cancel_wait(hbCall); thread_call_free(hbCall); hbCall = nullptr; }
+    if (hbGpp) { hbGpp->release(); hbGpp = nullptr; }
+    if (hbPegp) { hbPegp->release(); hbPegp = nullptr; }
+    if (batt) { batt->release(); batt = nullptr; }
     if (offCall) { thread_call_cancel_wait(offCall); thread_call_free(offCall); offCall = nullptr; }
     if (tryCall) { thread_call_cancel_wait(tryCall); thread_call_free(tryCall); tryCall = nullptr; }
     if (gpu) { gpu->release(); gpu = nullptr; }
@@ -324,4 +382,108 @@ void StrixDgpuClaim::powerOff()
     if (aud) aud->release();
     if (pegE) pegE->release();
     if (gppE) gppE->release();
+}
+
+
+// ---- power-source heartbeat ----------------------------------------------------------------------------------------------
+// Plugging the charger in hard-hung an Eco boot (2026-11-10 09:14). To see what the card/link does around an AC change this
+// samples for 20 s after every power-source event, 4 times a second, from a kernel thread call:
+//   T = ms since the event, n = tick, g = GPP9.GSTA (1 powered, 0 off), v = PEGP vendor id (config read), p = PEGP PMCSR,
+//   c = PEGP _PSC. Config space is not read while GSTA says off and the vendor is already known to be 0xffff; v/p/c are
+//   sampled every 4th tick only. The last 8 samples go into NVRAM "strix-gpu-hb" every tick (no sync) and are committed with a
+//   forced sync at the event, every strix-gpu-hb-sync ticks (default 8 = 2 s; 0 = only start and end) and at the end.
+//   The last 32 samples are also published as property hb-ring for a live check.
+IOReturn StrixDgpuClaim::acadMsg(void *target, void *, UInt32 type, IOService *, void *, vm_size_t)
+{
+    if (type == kIOACPIMessageDeviceNotification) static_cast<StrixDgpuClaim *>(target)->hbTrigger("acad");
+    return kIOReturnSuccess;
+}
+
+void StrixDgpuClaim::hbBattPoll()
+{
+    if (!batt) {
+        if (OSDictionary *m = IOService::serviceMatching("AppleSmartBattery")) { batt = IOService::copyMatchingService(m); m->release(); }
+    }
+    if (batt) {
+        OSObject *v = batt->getProperty("ExternalConnected");
+        if (v) {
+            int ac = v == kOSBooleanTrue ? 1 : 0;
+            if (battLast >= 0 && ac != battLast) { gHbAc = ac; hbTrigger("batt"); }
+            battLast = ac;
+        }
+    }
+    uint64_t dl;
+    clock_interval_to_deadline(1000, kMillisecondScale, &dl);
+    if (pollCall) thread_call_enter_delayed(pollCall, dl);
+}
+
+void StrixDgpuClaim::hbTrigger(const char *src)
+{
+    if (!hbCall || !OSCompareAndSwap(0, 1, &gHbRunning)) return;       // a run is already sampling
+    gHbEvents++;
+    cp(gHbSrc, src, sizeof gHbSrc);
+    if (batt) if (OSObject *v = batt->getProperty("ExternalConnected")) gHbAc = v == kOSBooleanTrue ? 1 : 0;
+    char sv[8];
+    hbSync = 8;
+    if (readVar("strix-gpu-hb-sync", sv, sizeof sv)) { uint32_t x = 0; for (char *c = sv; *c >= '0' && *c <= '9'; c++) x = x * 10 + (*c - '0'); hbSync = x; }
+    hbN = 0; hbPrev = 0; hbT0 = mach_absolute_time();
+    hbLastG = ~0u; hbVendor = gOff ? gVendorAfter : ~0u; hbPmcsr = ~0u; hbPsc = ~0u;
+    gHbFlips = 0; gHbFirstFlipMs = ~0u; gHbMaxGapMs = 0;
+    uint64_t dl;
+    clock_interval_to_deadline(1, kMillisecondScale, &dl);
+    thread_call_enter_delayed(hbCall, dl);
+}
+
+void StrixDgpuClaim::hbSample()
+{
+    if (!hbGpp) { IORegistryEntry *e = IORegistryEntry::fromPath("IOACPIPlane:/_SB/PCI0@0/GPP9@30001"); hbGpp = OSDynamicCast(IOACPIPlatformDevice, e); if (!hbGpp && e) e->release(); }
+    if (!hbPegp) { IORegistryEntry *e = IORegistryEntry::fromPath("IOACPIPlane:/_SB/PCI0@0/GPP9@30001/PEGP@0"); hbPegp = OSDynamicCast(IOACPIPlatformDevice, e); if (!hbPegp && e) e->release(); }
+    uint64_t now = mach_absolute_time(), ns;
+    absolutetime_to_nanoseconds(now - hbT0, &ns);
+    uint32_t ms = (uint32_t)(ns / 1000000ULL);
+    uint32_t n = hbN++;
+    if (hbPrev) { uint64_t d; absolutetime_to_nanoseconds(now - hbPrev, &d); uint32_t gap = (uint32_t)(d / 1000000ULL); if (gap > gHbMaxGapMs) gHbMaxGapMs = gap; }
+    hbPrev = now;
+
+    uint32_t g = evalInt(hbGpp, "GSTA");
+    if (n && hbLastG != ~0u && g != ~0u && g != hbLastG) { gHbFlips++; if (g == 1 && gHbFirstFlipMs == ~0u) gHbFirstFlipMs = ms; }
+    hbLastG = g;
+    bool deadKnown = g == 0 && hbVendor == 0xffff;                       // never read config of a link known to be down
+    if (n % 4 == 0) {
+        if (!deadKnown && gpu) {
+            hbVendor = gpu->configRead16(0);
+            if (!pmCapDone) { pmCapDone = true; uint8_t pm = 0; if (gpu->findPCICapability(kIOPCIPowerManagementCapability, &pm)) pmCap = pm; }
+            hbPmcsr = (hbVendor != 0xffff && pmCap) ? gpu->configRead16(pmCap + 4) : ~0u;
+        }
+        hbPsc = evalInt(hbPegp, "_PSC");
+    }
+    char buf[44];
+    char v[8] = "-", pm[8] = "-", pc[8] = "-";
+    if (hbVendor != ~0u) snprintf(v, sizeof v, "%04x", (unsigned)hbVendor);
+    if (hbPmcsr != ~0u) snprintf(pm, sizeof pm, "%04x", (unsigned)hbPmcsr);
+    if (hbPsc != ~0u) snprintf(pc, sizeof pc, "%u", (unsigned)hbPsc);
+    snprintf(buf, sizeof buf, "T%u n%u g%d v%s p%s c%s", (unsigned)ms, (unsigned)n, g == ~0u ? -1 : (int)g, v, pm, pc);
+    cp(gRing[gRingN % HB_RING], buf, sizeof gRing[0]);
+    gRingN++;
+    gHbLastN = n + 1;
+
+    // NVRAM: last 8 samples in one variable
+    char line[8 * 44 + 40];
+    snprintf(line, sizeof line, "ev%u %s ac%d ", (unsigned)gHbEvents, gHbSrc, gHbAc);
+    size_t len = strlen(line);
+    uint32_t cnt = gRingN < 8 ? gRingN : 8;
+    for (uint32_t i = 0; i < cnt && len + 46 < sizeof line; i++) {
+        uint32_t idx = (gRingN - cnt + i) % HB_RING;
+        snprintf(line + len, sizeof line - len, "%s;", gRing[idx]);
+        len = strlen(line);
+    }
+    bool last = n + 1 >= HB_TICKS;
+    bool sync = n == 0 || last || (hbSync && n % hbSync == 0);
+    writeVar("strix-gpu-hb", line, sync);
+    if (gInfo) { gInfo->publish(); gInfo->publishRing(); }
+
+    if (last) { OSCompareAndSwap(1, 0, &gHbRunning); return; }
+    uint64_t dl;
+    clock_interval_to_deadline(250, kMillisecondScale, &dl);
+    thread_call_enter_delayed(hbCall, dl);
 }
