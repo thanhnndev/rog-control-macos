@@ -58,6 +58,49 @@ struct GpuState {
     func restartRequired(ac: Bool) -> Bool { present && supported && (boot ?? 0) != wanted(ac: ac) }
 }
 
+
+// StrixDgpuGate's own properties (IOResources service, readable without root). The ABI 6 words say what the gate did; this adds
+// the detail: why (state text), what the firmware reported, and the AC-change heartbeat (hb-*).
+struct GateInfo {
+    var present = false
+    var state = ""
+    var gstaBefore: Int?, gstaAfter: Int?, psc: Int?, vendorAfter: Int?
+    var events = 0, src = "none", ac: Int?, ticks = 0, flips = 0, firstFlipMs: Int?, maxGapMs = 0
+    var ring: [String] = []
+    static func read() -> GateInfo {
+        var g = GateInfo()
+        let svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("StrixDgpuGate"))
+        guard svc != 0 else { return g }
+        defer { IOObjectRelease(svc) }
+        var cf: Unmanaged<CFMutableDictionary>?
+        guard IORegistryEntryCreateCFProperties(svc, &cf, kCFAllocatorDefault, 0) == KERN_SUCCESS, let d = cf?.takeRetainedValue() as? [String: Any] else { return g }
+        func n(_ k: String) -> Int? { (d[k] as? NSNumber)?.intValue }
+        g.present = true
+        g.state = d["gate-state"] as? String ?? ""
+        g.gstaBefore = n("gsta-before"); g.gstaAfter = n("gsta-after"); g.psc = n("psc"); g.vendorAfter = n("vendor-after")
+        g.events = n("hb-events") ?? 0; g.src = d["hb-src"] as? String ?? "none"
+        if let a = n("hb-ac"), a != 0xff { g.ac = a }
+        g.ticks = n("hb-ticks") ?? 0; g.flips = n("hb-gsta-flips") ?? 0; g.firstFlipMs = n("hb-first-flip-ms"); g.maxGapMs = n("hb-max-gap-ms") ?? 0
+        g.ring = d["hb-ring"] as? [String] ?? []
+        return g
+    }
+}
+
+/// What the app shows for the GPU, in words. The popover and the window share these so they never disagree.
+extension GpuState {
+    static let names = ["Standard", "Eco", "Optimized"]          // stored values 0, 1, 2
+    var requestedName: String { Self.names[min(max(mode, 0), 2)] }
+    var runningName: String { (boot ?? 0) == 1 ? "Eco" : "Standard" }
+    /// RTX power state: "Off", "Powering off", "On"
+    var rtxText: String { held ? (poweredOff ? "Off" : "Powering off") : "On" }
+    func pending(ac: Bool) -> Bool { restartRequired(ac: ac) }
+    var usable: Bool { present && supported }
+}
+
+struct CpuPolicy {
+    var epp: Int?, boost: Bool?
+}
+
 // Slash lighting (asuswmi_abi.h ASUS_SLASH_*): mode index, brightness 0..3 (0 = off), interval 0..5
 struct Slash: Equatable {
     static let modes = ["Static", "Bounce", "Slash", "Loading", "Bit Stream", "Transmission", "Flow", "Flux",
@@ -159,6 +202,15 @@ enum Sensors {
         let p = v.split(separator: " ")
         guard p.count == 2, let sq = UInt32(p[0]), let c = UInt32(p[1]) else { return nil }
         return (sq, c)
+    }
+    // energy preference (EPP) and core boost of CPU 0, from the AmdCppc report
+    static func cpuPolicy() -> CpuPolicy {
+        var c = CpuPolicy()
+        guard let r = string("debug.amdcppc.report"), let first = r.split(separator: "|").first else { return c }
+        let t = String(first)
+        if let rg = t.range(of: "epp ") { c.epp = Int(t[rg.upperBound...].prefix(while: { $0.isNumber })) }
+        if let rg = t.range(of: "CpbDis=") { c.boost = t[rg.upperBound...].first == "0" }
+        return c
     }
     static func read() -> (tctl: Double?, watts: Double?) {
         guard let s = string("debug.amdcppc.sensors") else { return (nil, nil) }
@@ -414,6 +466,9 @@ final class RogModel: ObservableObject {
     @Published var message = ""
     @Published var gpu = GpuState()
     @Published var gpuError = ""
+    @Published var gate = GateInfo()
+    @Published var cpuPol = CpuPolicy()
+    @Published var diagOpen = false
     @Published var loginEnabled = LoginItem.enabled
     @Published var curve: [UInt8]? = nil
     @Published var gpuCurve: [UInt8]? = nil
@@ -463,7 +518,7 @@ final class RogModel: ObservableObject {
 
     init() {
         refresh()
-        gpu = Asus.gpu()
+        gpu = Asus.gpu(); gate = GateInfo.read(); cpuPol = Sensors.cpuPolicy()
         // first run: keep what the firmware is doing now instead of imposing a default
         let d = UserDefaults.standard
         if st.present, d.string(forKey: st.ac ? "ac.mode" : "battery.mode") == nil, let m = Mode.from(profile: st.profile) {
@@ -528,7 +583,7 @@ final class RogModel: ObservableObject {
         lastAC = st.ac
         if previousMode != activeMode { loadCurve() }
         if !preview { sound = Sound.state() }
-        if !preview, visible { gpu = Asus.gpu() }      // the window only; a plain read, nothing is written
+        if !preview, visible { gpu = Asus.gpu(); gate = GateInfo.read(); cpuPol = Sensors.cpuPolicy() }      // the window only; a plain read, nothing is written
         doctorTick += 1
         if !preview, visible, doctorTick % 15 == 0 || doctor.isEmpty { runDoctor() }   // every 30 s while the window shows
         onChange?()
@@ -539,7 +594,7 @@ final class RogModel: ObservableObject {
         if mode != 0, !gpu.gate { gpuError = "StrixDgpuGate is not installed: the setting is stored but Eco will not take effect." } else { gpuError = "" }
         if Asus.setGpuMode(mode) != KERN_SUCCESS { gpuError = "The GPU mode was not stored."; return }
         gpu.stored = mode; message = "GPU mode stored for the next restart"
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { MainActor.assumeIsolated { [weak self] in self?.gpu = Asus.gpu() } }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { MainActor.assumeIsolated { [weak self] in self?.gpu = Asus.gpu(); self?.gate = GateInfo.read() } }
     }
 
     func powerChanged() {
@@ -769,6 +824,58 @@ struct PopoverTile: View {
     }
 }
 
+// ---- GPU mode in the menu bar panel ------------------------------------------------------------------------------------------
+// One glance: what the RTX is doing, the three modes, and an amber note only when the next start will differ from this one.
+struct RtxBadge: View {
+    let g: GpuState
+    var body: some View {
+        let off = g.held && g.poweredOff, pend = g.held && !g.poweredOff
+        HStack(spacing: 6) {
+            Circle().fill(pend ? T.amber : off ? Color.green : T.dim).frame(width: 6, height: 6)
+            Text("RTX \(g.rtxText.lowercased())").font(.system(size: 10.5)).foregroundStyle(T.dim)
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("RTX \(g.rtxText)")
+    }
+}
+
+struct GpuPopoverTile: View {
+    @ObservedObject var m: RogModel
+    static let items: [(v: Int, name: String, icon: String)] = [(1, "Eco", "leaf.fill"), (0, "Standard", "square.split.2x1.fill"), (2, "Optimized", "bolt.badge.automatic.fill")]
+    var body: some View {
+        let g = m.gpu
+        let pending = g.pending(ac: m.st.ac)
+        VStack(alignment: .leading, spacing: 8) {
+            HStack { Caps("GPU"); Spacer(); RtxBadge(g: g) }
+            HStack(spacing: 4) {
+                ForEach(Self.items, id: \.v) { it in
+                    Button { m.setGpuMode(it.v) } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: it.icon).font(.system(size: 10))
+                            Text(it.name).font(.system(size: 11.5, weight: g.mode == it.v ? .semibold : .regular)).lineLimit(1)
+                        }
+                        .frame(maxWidth: .infinity).frame(height: 28)
+                    }
+                    .buttonStyle(RogButtonStyle(selected: g.mode == it.v, cut: 5))
+                    .accessibilityLabel("GPU mode \(it.name)").accessibilityAddTraits(g.mode == it.v ? .isSelected : [])
+                }
+            }
+            .disabled(!g.nvramOK).opacity(g.nvramOK ? 1 : 0.5)
+            if pending {
+                Label("Restart to switch to \(g.wanted(ac: m.st.ac) == 1 ? "Eco" : "Standard")", systemImage: "arrow.clockwise.circle.fill")
+                    .font(.system(size: 10.5, weight: .semibold)).foregroundStyle(T.amber)
+            } else if g.tripped {
+                Label("Eco did not finish last start, running Standard", systemImage: "exclamationmark.triangle.fill")
+                    .font(.system(size: 10.5)).foregroundStyle(T.amber).fixedSize(horizontal: false, vertical: true)
+            }
+            ErrorLine(text: m.gpuError)
+        }
+        .padding(12)
+        .background(T.surface, in: Chamfer(cut: 10))
+        .overlay(Chamfer(cut: 10).stroke(T.line))
+    }
+}
+
 struct ContentView: View {
     @ObservedObject var m: RogModel
     let openWindow: (RogDialog?) -> Void
@@ -782,6 +889,7 @@ struct ContentView: View {
             }
             header
             modes
+            if m.gpu.usable { GpuPopoverTile(m: m) }
             VStack(spacing: 0) {
                 row("Charge limit") {
                     let opts = [60, 80, 100]
@@ -1300,6 +1408,7 @@ struct RogWindowView: View {
             }
             .fixedSize(horizontal: false, vertical: true)
             GpuTile(m: m).fixedSize(horizontal: false, vertical: true)
+            DiagnosticsCard(m: m).fixedSize(horizontal: false, vertical: true)
         }
         .padding(.horizontal, 18).padding(.bottom, 18)
         .frame(width: 1120, alignment: .topLeading)
@@ -1509,46 +1618,155 @@ struct GpuTile: View {
     var body: some View {
         let g = m.gpu
         let usable = g.present && g.supported && g.nvramOK
+        let pending = g.pending(ac: m.st.ac)
         Card(pad: 14) {
             TileHead(title: "GPU mode")
-            HStack(spacing: 8) {
-                ForEach(order, id: \.self) { v in
-                    let info = Self.modes[v == 1 ? 0 : v == 0 ? 1 : 2]
-                    Button { m.setGpuMode(v) } label: {
-                        VStack(spacing: 4) {
-                            Image(systemName: info.1).font(.system(size: 14))
-                            Text(info.0).font(.system(size: 12, weight: g.mode == v ? .semibold : .regular))
+            HStack(alignment: .top, spacing: 18) {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 8) {
+                        ForEach(order, id: \.self) { v in
+                            let info = Self.modes[v == 1 ? 0 : v == 0 ? 1 : 2]
+                            Button { m.setGpuMode(v) } label: {
+                                VStack(spacing: 4) {
+                                    Image(systemName: info.1).font(.system(size: 14))
+                                    Text(info.0).font(.system(size: 12, weight: g.mode == v ? .semibold : .regular))
+                                }
+                                .frame(maxWidth: .infinity).frame(height: 52)
+                            }
+                            .buttonStyle(RogButtonStyle(selected: g.mode == v, cut: 8))
+                            .help(info.2).accessibilityLabel("GPU mode \(info.0)").accessibilityAddTraits(g.mode == v ? .isSelected : [])
                         }
-                        .frame(maxWidth: .infinity).frame(height: 52)
+                        VStack(spacing: 4) {
+                            Image(systemName: "bolt.fill").font(.system(size: 14))
+                            Text("Ultimate").font(.system(size: 12))
+                        }
+                        .frame(maxWidth: .infinity).frame(height: 52).foregroundStyle(T.faint).opacity(0.6)
+                        .background(T.raised.opacity(0.5), in: Chamfer(cut: 8))
+                        .help("Not available: Ultimate sends the panel to the RTX, and this Mac draws the desktop on the Radeon 890M.")
+                        .accessibilityLabel("GPU mode Ultimate, not available")
                     }
-                    .buttonStyle(RogButtonStyle(selected: g.mode == v, cut: 8))
-                    .help(info.2).accessibilityLabel("GPU mode \(info.0)").accessibilityAddTraits(g.mode == v ? .isSelected : [])
+                    .disabled(!usable).opacity(usable ? 1 : 0.5)
+                    Text(usable ? Self.modes[g.mode == 1 ? 0 : g.mode == 0 ? 1 : 2].2 : status(g)).font(.system(size: 11)).foregroundStyle(T.dim)
+                        .fixedSize(horizontal: false, vertical: true)
+                    ErrorLine(text: m.gpuError)
                 }
-                VStack(spacing: 4) {
-                    Image(systemName: "bolt.fill").font(.system(size: 14))
-                    Text("Ultimate").font(.system(size: 12))
+                .frame(maxWidth: .infinity, alignment: .topLeading)
+                if usable {
+                    Rectangle().fill(T.line).frame(width: 1)
+                    VStack(alignment: .leading, spacing: 9) {
+                        kv("Requested", g.requestedName)
+                        kv("Running now", g.runningName + (g.tripped ? ", Eco did not finish" : ""))
+                        HStack { Text("RTX").font(.system(size: 11.5)).foregroundStyle(T.dim); Spacer(); RtxBadge(g: g) }
+                        HStack {
+                            Text("Takes effect").font(.system(size: 11.5)).foregroundStyle(T.dim); Spacer()
+                            if pending {
+                                Label("Restart required", systemImage: "arrow.clockwise.circle.fill").font(.system(size: 11, weight: .semibold)).foregroundStyle(T.amber)
+                            } else { Text("Applied").font(.system(size: 11.5)).foregroundStyle(T.text) }
+                        }
+                        if g.tripped {
+                            Label("The last Eco start did not finish, so this start kept the RTX on. Choose Eco again to retry.", systemImage: "exclamationmark.triangle.fill")
+                                .font(.system(size: 10.5)).foregroundStyle(T.amber).fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                    .frame(width: 300, alignment: .topLeading)
                 }
-                .frame(maxWidth: .infinity).frame(height: 52).foregroundStyle(T.faint).opacity(0.6)
-                .background(T.raised.opacity(0.5), in: Chamfer(cut: 8))
-                .help("Not available: Ultimate sends the panel to the RTX, and this Mac draws the desktop on the Radeon 890M.")
-                .accessibilityLabel("GPU mode Ultimate, not available")
             }
-            .padding(.top, 8).disabled(!usable).opacity(usable ? 1 : 0.5)
-            Text(status(g)).font(.system(size: 11)).foregroundStyle(T.dim).padding(.top, 8)
-            if g.restartRequired(ac: m.st.ac) {
-                Label("Restart required: the computer started in \((g.boot ?? 0) == 1 ? "Eco" : "Standard"), \(g.wanted(ac: m.st.ac) == 1 ? "Eco" : "Standard") is selected.",
-                      systemImage: "arrow.clockwise.circle.fill").font(.system(size: 11, weight: .semibold)).foregroundStyle(T.amber).padding(.top, 4)
-            }
-            ErrorLine(text: m.gpuError).padding(.top, 4)
+            .padding(.top, 8)
         }
+    }
+    func kv(_ k: String, _ v: String) -> some View {
+        HStack { Text(k).font(.system(size: 11.5)).foregroundStyle(T.dim); Spacer(); Text(v).font(.system(size: 11.5)).foregroundStyle(T.text) }
     }
     func status(_ g: GpuState) -> String {
         if !g.present { return "GPU mode needs AsusWmi 0.3.0 (ABI 6)." }
         if !g.supported { return "GPU mode is not available on this system (needs macOS 26 and the firmware's dGPU switch)." }
-        if g.tripped { return "The last Eco start did not finish, so this start kept the RTX on. Choose Eco again to retry." }
-        let now = g.held ? (g.poweredOff ? "RTX off" : "RTX held away from the driver, power-off pending") : g.gate ? "RTX on" : "RTX on (StrixDgpuGate not loaded)"
-        let how = g.mode == 2 ? " Optimized: this start was on \(g.boot == 1 ? "battery" : "the charger")." : ""
-        return "Now: \(now). Changes apply after a restart.\(how)"
+        if !g.nvramOK { return "GPU mode cannot be stored: NVRAM is not reachable." }
+        return ""
+    }
+}
+
+// Collapsible detail for people who debug the drivers: the gate's view of the RTX, the AC-change heartbeat, the CPU policy.
+struct DiagnosticsCard: View {
+    @ObservedObject var m: RogModel
+    var body: some View {
+        Card(pad: 14) {
+            Button { withAnimation(.easeOut(duration: 0.15)) { m.diagOpen.toggle() } } label: {
+                HStack(spacing: 8) {
+                    Caps("Diagnostics")
+                    Text("GPU gate, power-source heartbeat, CPU policy").font(.system(size: 11)).foregroundStyle(T.faint)
+                    Spacer()
+                    Image(systemName: m.diagOpen ? "chevron.up" : "chevron.down").font(.system(size: 10, weight: .bold)).foregroundStyle(T.dim)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain).accessibilityLabel("Diagnostics").accessibilityValue(m.diagOpen ? "expanded" : "collapsed")
+            if m.diagOpen {
+                HStack(alignment: .top, spacing: 18) {
+                    column("RTX power gate") { gateRows }
+                    Rectangle().fill(T.line).frame(width: 1)
+                    column("Power-source heartbeat") { heartbeatRows }
+                    Rectangle().fill(T.line).frame(width: 1)
+                    column("System") { systemRows }
+                }
+                .padding(.top, 12)
+            }
+        }
+    }
+    func column<C: View>(_ title: String, @ViewBuilder _ c: () -> C) -> some View {
+        VStack(alignment: .leading, spacing: 7) { Caps(title); c() }.frame(maxWidth: .infinity, alignment: .topLeading)
+    }
+    func kv(_ k: String, _ v: String, mono: Bool = false) -> some View {
+        HStack(alignment: .firstTextBaseline) {
+            Text(k).font(.system(size: 11)).foregroundStyle(T.dim); Spacer(minLength: 8)
+            Text(v).font(mono ? .system(size: 10.5, design: .monospaced) : .system(size: 11)).foregroundStyle(T.text).multilineTextAlignment(.trailing)
+        }
+    }
+    var gateRows: some View {
+        let g = m.gate, s = m.gpu
+        return Group {
+            if !g.present {
+                Text("StrixDgpuGate is not loaded.").font(.system(size: 11)).foregroundStyle(T.dim)
+            } else {
+                kv("Gate", s.held ? "Holding the RTX" : "Not holding")
+                kv("Loop guard", s.tripped ? "Tripped, started in Standard" : "Clear")
+                kv("Firmware power", g.gstaAfter.map { $0 == 0 ? "Off" : "On" } ?? "–")
+                kv("Before / after", "\(g.gstaBefore.map(String.init) ?? "–") → \(g.gstaAfter.map(String.init) ?? "–")")
+                kv("Device state", g.psc.map { $0 == 3 ? "D3 (off)" : "D\($0)" } ?? "–")
+                kv("Card answers", g.vendorAfter.map { $0 == 0xffff ? "No (link down)" : String(format: "Yes, 0x%04X", $0) } ?? "–")
+                Text(g.state).font(.system(size: 10.5, design: .monospaced)).foregroundStyle(T.faint).fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+    var heartbeatRows: some View {
+        let g = m.gate
+        return Group {
+            if !g.present || g.events == 0 {
+                Text(g.present ? "No charger plug or unplug seen since the start." : "Needs StrixDgpuGate with the heartbeat.").font(.system(size: 11)).foregroundStyle(T.dim)
+            } else {
+                kv("Events", "\(g.events)")
+                kv("Last seen by", g.src == "acad" ? "AC adapter notify" : g.src == "batt" ? "Battery poll" : g.src)
+                kv("Power then", g.ac.map { $0 == 1 ? "Charger" : "Battery" } ?? "–")
+                kv("Samples", "\(g.ticks) of 80")
+                kv("Card power changes", "\(g.flips)" + (g.firstFlipMs.map { ", first at \($0) ms" } ?? ""))
+                kv("Longest gap", "\(g.maxGapMs) ms")
+                if !g.ring.isEmpty {
+                    ScrollView { Text(g.ring.suffix(32).joined(separator: "\n")).font(.system(size: 10, design: .monospaced)).foregroundStyle(T.faint)
+                        .frame(maxWidth: .infinity, alignment: .leading) }
+                        .frame(height: 74)
+                }
+            }
+        }
+    }
+    var systemRows: some View {
+        let s = m.gpu, c = m.cpuPol
+        return Group {
+            kv("AsusWmi", m.st.present ? "ABI \(m.st.abi)" : "Not loaded")
+            kv("dGPU switch (firmware)", s.dgpuDsts == ~0 ? "–" : s.dgpuDsts & 1 != 0 ? "Disabled" : "Enabled")
+            kv("MUX", s.muxDsts == ~0 ? "–" : s.muxDsts & 1 != 0 ? "dGPU direct" : "Hybrid")
+            kv("CPU energy preference", c.epp.map { "\($0) of 255" } ?? "–")
+            kv("CPU boost", c.boost.map { $0 ? "On" : "Off" } ?? "–")
+            kv("Darwin", s.darwin == 0 ? "–" : "\(s.darwin).x")
+        }
     }
 }
 
@@ -2826,6 +3044,21 @@ enum Snapshot {
             m.dialog = d
             render(RogWindowView(m: m), size: NSSize(width: 1120, height: 0), dark: true,
                    to: out.appendingPathComponent("window-\(name)\(tag).png"))
+        }
+        // GPU mode scenarios: Eco running, restart needed (asked Standard, booted Eco), loop guard tripped
+        m.dialog = nil; m.diagOpen = true
+        m.gate = GateInfo(present: true, state: "eco: powered off via PEGP _DSM 0x1A + _PS3", gstaBefore: 1, gstaAfter: 0, psc: 3, vendorAfter: 0xffff,
+                          events: 2, src: "acad", ac: 1, ticks: 80, flips: 1, firstFlipMs: 1250, maxGapMs: 262,
+                          ring: ["t=0 ac=0 gsta=0 v=ffff", "t=250 ac=0 gsta=0 v=ffff", "t=500 ac=1 gsta=0 v=ffff", "t=750 ac=1 gsta=1 v=ffff"])
+        m.cpuPol = CpuPolicy(epp: 128, boost: true)
+        let scen: [(String, Int?, Int?, UInt32)] = [
+            ("gpu-eco", 1, 1, 0x01 | 0x02 | 0x04 | 0x08 | 0x20),
+            ("gpu-restart", 0, 1, 0x01 | 0x02 | 0x04 | 0x08 | 0x20),
+            ("gpu-tripped", 1, 0, 0x01 | 0x02 | 0x20 | 0x40)]
+        for (name, stored, boot, flags) in scen {
+            m.gpu = GpuState(present: true, flags: flags, stored: stored, boot: boot, dgpuDsts: 0x10000, muxDsts: 0x10000, pg00: 0, darwin: 25)
+            render(ContentView(m: m, openWindow: { _ in }), size: NSSize(width: 320, height: 0), dark: true, to: out.appendingPathComponent("popover-\(name)\(tag).png"))
+            render(RogWindowView(m: m), size: NSSize(width: 1120, height: 0), dark: true, to: out.appendingPathComponent("window-\(name)\(tag).png"))
         }
         for mode in Mode.allCases {         // menu bar icons, drawn at 4x for review
             let img = AppDelegate.badgeImage(mode)
