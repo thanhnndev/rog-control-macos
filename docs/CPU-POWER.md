@@ -36,10 +36,14 @@ lowest non-linear as min, desired=0 (autonomous). EPP mapping:
 
 | Power/profile | EPP |
 | --- | ---: |
-| AC Performance / Manual | 128 |
+| AC Balanced / Manual | 191 |
 | AC Turbo | 0 |
-| Battery Performance / Turbo / Manual | 191 |
+| Battery Balanced / Turbo / Manual | 191 |
 | Silent (either source) | 255 |
+
+This follows asusctl's defaults (`platform_profile_linked_epp`, asusd/src/config.rs): Quiet `power`, Balanced
+`balance_power`, Performance `performance`. RogControl's "Balanced" (Armoury Crate "Performance") is ASUS throttle policy 0, which asusctl calls Balanced;
+"Turbo" is policy 1, which asusctl calls Performance. Until 2026-11-08 AC Balanced used 128 (`balance_performance`).
 
 ASUS profile comes from AsusWmi's tracked set_profile, because raw firmware DSTS returns 3 here.
 Missing ASUS status defaults to the battery preference. Policy never changes firmware power limits,

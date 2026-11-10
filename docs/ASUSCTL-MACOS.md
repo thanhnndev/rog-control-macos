@@ -22,9 +22,9 @@ highest performance, so the limit sits in the platform. The profile and the PPT 
 
 | asusctl feature | Linux path | macOS route | Status |
 |---|---|---|---|
-| Platform profile (Silent / Performance / Turbo) | `asus-wmi` throttle_thermal_policy, WMI dev `0x00120075` (0 balanced = Armoury Crate "Performance", 1 turbo, 2 silent) | AsusWmi user client, RogControl | ✅ works (owner-confirmed 2026-10-12) |
+| Platform profile (Silent / Balanced / Turbo, the G-Helper names) | `asus-wmi` throttle_thermal_policy, WMI dev `0x00120075` (0 balanced = Armoury Crate "Performance", 1 turbo, 2 silent) | AsusWmi user client, RogControl | ✅ works (owner-confirmed 2026-10-12) |
 | CPU power limits SPL / SPPT / FPPT ("Manual") | `asus-armoury` ppt_*; GA403WM: AC 15-80 / 25-80 / 35-80 W, battery 15-35 / 25-35 / 35-65 W; `requires_fan_curve` | AsusWmi checks the range for the current source (ACPI `ACAD._PSR`) and refuses limits until a custom fan curve is active (EBUSY / `kIOReturnNotPermitted`), as asus-armoury does | ✅ works (owner-confirmed 2026-10-12) |
-| Fan curves | dev `0x00110024` (CPU) / `0x00110025` (GPU); DSTS with arg1 = profile returns 8 temps + 8 duties; DEVS packs them into 4 dwords | read and write in AsusWmi (temps rising, duties not falling, top point >= 40 %); RogControl "Manual" uses a chosen firmware curve (Silent / Performance / Turbo) as the custom curve; no curve editor yet | ✅ works (owner-confirmed 2026-10-12) |
+| Fan curves | dev `0x00110024` (CPU) / `0x00110025` (GPU); DSTS with arg1 = profile returns 8 temps + 8 duties; DEVS packs them into 4 dwords | read and write in AsusWmi (temps rising, duties not falling, top point >= 40 %); RogControl "Manual" uses a chosen firmware curve (Silent / Balanced / Turbo) as the custom curve; no curve editor yet | ✅ works (owner-confirmed 2026-10-12) |
 | Fan speeds | dev `0x00110013` / `0x00110014`, value x 100 rpm | RogControl | ✅ works (owner-confirmed 2026-10-12) |
 | Battery charge limit | dev `0x00120057` | RogControl 60 / 80 / 100 %, re-applied at start | ✅ works (owner-confirmed 2026-10-12) |
 | Profile per power source | asusd | RogControl keeps one setting set for AC and one for battery and re-applies on IOPowerSources changes and at login | ✅ works (owner-confirmed 2026-10-12) |
@@ -47,7 +47,7 @@ Measuring the profiles of this machine (no sudo, through the user client):
 /Applications/RogControl.app/Contents/MacOS/RogControl --bench 20
 ```
 
-Runs Silent, Performance and Turbo (AC only) for 20 s each with every CPU busy and prints average and peak package power,
+Runs Silent, Balanced and Turbo (AC only) for 20 s each with every CPU busy and prints average and peak package power,
 peak Tctl, fan speeds and the Zen 5 / Zen 5c clocks, then puts the previous profile back.
 
 ## AsusWmi (phase 1)
