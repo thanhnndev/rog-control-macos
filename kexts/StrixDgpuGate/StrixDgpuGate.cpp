@@ -13,6 +13,9 @@
 //                                                        starts on battery (ACPI0003._PSR == 0), decided once, here
 //   NVRAM  strix-gpu-eco-try = 1                          set when Eco is claimed, cleared after 90 s of uptime. Still 1 at
 //                                                        the next probe = the last Eco boot did not finish: stand down once
+//   NVRAM  strix-gpu-eco-boots / strix-gpu-eco-cleared    evidence: Eco boot counter; "<counter>:<awake s>" written before try is cleared.
+//                                                        try=1 with cleared == boots is a lost write (stale), not a failed boot.
+//                                                        try is cleared at 90 s, again at 5 min, and on WillRestart / WillPowerOff
 //   boot-args  -strixgate_off      never claim (recovery)
 //              strixgate_dry=1     claim the card (NVRM stays off) but do not power it off: first-install test
 //
@@ -32,12 +35,18 @@
 
 #define VAR_MODE "strix-gpu-mode"
 #define VAR_TRY  "strix-gpu-eco-try"
+#define VAR_BOOTS   "strix-gpu-eco-boots"      // counts Eco claims (one per boot); written in start()
+#define VAR_CLEARED "strix-gpu-eco-cleared"    // "<boot counter>:<awake uptime s>" written just before try is cleared
 
 static void cp(char *d, const char *s, size_t n) { size_t i = 0; for (; i + 1 < n && s[i]; i++) d[i] = s[i]; d[i] = 0; }
 static bool gHeld, gOff, gTripped, gDry;
 static int gEffective = 0;
 static uint32_t gSta = ~0u, gGstaBefore = ~0u, gGstaAfter = ~0u, gPsc = ~0u, gVendorAfter = ~0u;
 static char gState[96] = "not probed";
+// loop-guard evidence (published as gate-* properties, see publish())
+static uint32_t gBootN, gClaimStarts, gClearStage, gClearUp;
+static bool gCleared, gStaleTry;
+static char gTryAtProbe[8], gPrevBoots[16], gPrevCleared[24], gClearedStr[24], gTryReadback[8];
 // power-source heartbeat (see hbTick): last 32 samples, event counters
 #define HB_RING 32
 #define HB_TICKS 80                 // 80 x 250 ms = 20 s
@@ -76,6 +85,16 @@ static void writeVar(const char *k, const char *val, bool sync = true)   // from
     o->release();
 }
 
+static uint32_t parseU(const char *s) { uint32_t x = 0; for (; *s >= '0' && *s <= '9'; s++) x = x * 10 + (*s - '0'); return x; }
+static uint32_t uptimeS() { uint64_t ns; absolutetime_to_nanoseconds(mach_absolute_time(), &ns); return (uint32_t)(ns / 1000000000ULL); }
+
+// every write of the loop-guard flag goes through here, so the log shows who wrote what and when
+static void setTry(const char *v, const char *why)
+{
+    IOLog("StrixDgpuGate: %s=%s (%s) at awake uptime %u s, boot counter %u\n", VAR_TRY, v, why, (unsigned)uptimeS(), (unsigned)gBootN);
+    writeVar(VAR_TRY, v);
+}
+
 static bool onBattery(bool *known)
 {
     *known = false;
@@ -110,6 +129,15 @@ public:
         if (gPsc != ~0u) setProperty("psc", (unsigned long long)gPsc, 32);
         if (gVendorAfter != ~0u) setProperty("vendor-after", (unsigned long long)gVendorAfter, 32);
         setProperty("gate-state", gState);
+        setProperty("gate-eco-boots", (unsigned long long)gBootN, 32);
+        setProperty("gate-claim-starts", (unsigned long long)gClaimStarts, 32);
+        setProperty("gate-try-stale", gStaleTry);
+        if (gTryAtProbe[0]) setProperty("gate-try-at-probe", gTryAtProbe);
+        if (gPrevBoots[0]) setProperty("gate-prev-boots", gPrevBoots);
+        if (gPrevCleared[0]) setProperty("gate-prev-cleared", gPrevCleared);
+        if (gClearedStr[0]) setProperty("gate-eco-cleared", gClearedStr);
+        if (gTryReadback[0]) setProperty("gate-try-readback", gTryReadback);
+        setProperty("gate-clear-stage", (unsigned long long)gClearStage, 32);
         setProperty("hb-events", (unsigned long long)gHbEvents, 32);
         setProperty("hb-src", gHbSrc);
         setProperty("hb-ac", (unsigned long long)(gHbAc < 0 ? 0xff : gHbAc), 32);
@@ -160,7 +188,7 @@ public:
     static void pollThread(thread_call_param_t self, thread_call_param_t) { static_cast<StrixDgpuClaim *>(self)->hbBattPoll(); }
     static IOReturn acadMsg(void *target, void *ref, UInt32 type, IOService *, void *, vm_size_t);
     static void offThread(thread_call_param_t self, thread_call_param_t);
-    static void clearTry(thread_call_param_t, thread_call_param_t) { writeVar(VAR_TRY, "0"); }
+    static void clearTry(thread_call_param_t self, thread_call_param_t);
     static IOReturn pmMsg(void *target, void *ref, UInt32 type, IOService *, void *, vm_size_t);
     void powerOff();
 };
@@ -194,11 +222,23 @@ static bool decide()
     }
     if (!eco) { note("standard: NVRM drives the RTX"); return false; }
     readVar(VAR_TRY, tr, sizeof tr);
-    if (tr[0] == '1') {          // the previous Eco boot never reached 90 s of uptime: let NVRM have the card this once
-        gTripped = true;
-        writeVar(VAR_TRY, "0");
-        note("standard: loop guard (previous Eco boot did not finish)");
-        return false;
+    cp(gTryAtProbe, tr, sizeof gTryAtProbe);
+    readVar(VAR_BOOTS, gPrevBoots, sizeof gPrevBoots);
+    readVar(VAR_CLEARED, gPrevCleared, sizeof gPrevCleared);
+    IOLog("StrixDgpuGate: probe sees %s=%s %s=%s %s=%s\n", VAR_TRY, tr[0] ? tr : "(none)", VAR_BOOTS, gPrevBoots[0] ? gPrevBoots : "(none)", VAR_CLEARED, gPrevCleared[0] ? gPrevCleared : "(none)");
+    if (tr[0] == '1') {
+        // try=1 means the last Eco boot did not reach its clear. But if the cleared record names that same boot, the boot did
+        // finish and only the try=0 write was lost: that is a stale flag, not a failed boot.
+        uint32_t prev = parseU(gPrevBoots), done = parseU(gPrevCleared);
+        if (prev && done == prev) {
+            gStaleTry = true;
+            setTry("0", "stale: previous Eco boot recorded as cleared");
+        } else {
+            gTripped = true;
+            setTry("0", "loop guard tripped");
+            note("standard: loop guard (previous Eco boot did not finish)");
+            return false;
+        }
     }
     gEco = true;
     return true;
@@ -228,11 +268,18 @@ bool StrixDgpuClaim::start(IOService *provider)
     gHeld = true; gEffective = 1;
     uint32_t dry = 0;
     gDry = PE_parse_boot_argn("strixgate_dry", &dry, sizeof dry) && dry == 1;
-    writeVar(VAR_TRY, "1");
     offCall = thread_call_allocate(&StrixDgpuClaim::offThread, this);
     tryCall = thread_call_allocate(&StrixDgpuClaim::clearTry, this);
     uint64_t dl;
-    if (tryCall) { clock_interval_to_deadline(90, kSecondScale, &dl); thread_call_enter_delayed(tryCall, dl); }
+    if (gClaimStarts++ == 0) {         // once per boot: a second start() must not re-arm the flag without a new clear behind it
+        char b[16];
+        readVar(VAR_BOOTS, b, sizeof b);
+        gBootN = parseU(b) + 1;
+        snprintf(b, sizeof b, "%u", (unsigned)gBootN);
+        writeVar(VAR_BOOTS, b);
+        setTry("1", "Eco claimed");
+        if (tryCall) { clock_interval_to_deadline(90, kSecondScale, &dl); thread_call_enter_delayed(tryCall, dl); }
+    } else IOLog("StrixDgpuGate: second Claim start() in this boot (#%u), %s left alone\n", (unsigned)gClaimStarts, VAR_TRY);
     if (IOPMrootDomain *rd = getPMRootDomain()) wake = rd->registerInterest(gIOGeneralInterest, &StrixDgpuClaim::pmMsg, this);
     hbCall = thread_call_allocate(&StrixDgpuClaim::hbThread, this);
     pollCall = thread_call_allocate(&StrixDgpuClaim::pollThread, this);
@@ -264,9 +311,36 @@ void StrixDgpuClaim::stop(IOService *provider)
     IOService::stop(provider);
 }
 
+// Stage 0 (90 s awake): record the boot as finished, clear the flag, read it back. Stage 1 (300 s): do it again, in case the
+// first write was dropped. The read-back is the registry copy of /options, so it proves the write was accepted, not that it
+// reached flash; gate-eco-cleared and gate-try-readback on the next boot are the proof.
+static void clearNow(const char *why)
+{
+    char c[24];
+    gClearUp = uptimeS();
+    snprintf(c, sizeof c, "%u:%u", (unsigned)gBootN, (unsigned)gClearUp);
+    cp(gClearedStr, c, sizeof gClearedStr);
+    writeVar(VAR_CLEARED, c);
+    setTry("0", why);
+    readVar(VAR_TRY, gTryReadback, sizeof gTryReadback);
+    IOLog("StrixDgpuGate: %s read back %s (%s)\n", VAR_TRY, gTryReadback[0] ? gTryReadback : "(none)", why);
+    gCleared = true;
+    if (gInfo) gInfo->publish();
+}
+
+void StrixDgpuClaim::clearTry(thread_call_param_t p, thread_call_param_t)
+{
+    StrixDgpuClaim *me = static_cast<StrixDgpuClaim *>(p);
+    uint32_t st = gClearStage++;
+    clearNow(st == 0 ? "clear at 90 s" : "clear again at 5 min");
+    if (st == 0 && me->tryCall) { uint64_t dl; clock_interval_to_deadline(210, kSecondScale, &dl); thread_call_enter_delayed(me->tryCall, dl); }
+}
+
 IOReturn StrixDgpuClaim::pmMsg(void *target, void *, UInt32 type, IOService *, void *, vm_size_t)
 {
     StrixDgpuClaim *me = static_cast<StrixDgpuClaim *>(target);
+    // A boot that got past its first clear is a good boot: write the flag again on the way out, so a lost write cannot trip the next one
+    if ((type == kIOMessageSystemWillPowerOff || type == kIOMessageSystemWillRestart) && gCleared) clearNow(type == kIOMessageSystemWillRestart ? "will restart" : "will power off");
     if (type == kIOMessageSystemHasPoweredOn && gHeld && !gDry && me->offCall) {   // a resume may bring the power resource back
         uint64_t dl;
         clock_interval_to_deadline(3, kSecondScale, &dl);

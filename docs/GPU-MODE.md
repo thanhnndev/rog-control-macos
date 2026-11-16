@@ -107,3 +107,13 @@ Steps:
 2. `scripts/build-rogcontrol.sh --install` (copies to /Applications, restarts the LaunchAgent). Undo: reinstall rogcontrol-v0.5.3.
 3. Reboot once. Check: `sysctl debug.asuswmi.status` shows `gpu_mode`, the app GPU tile reads "Now: RTX off" with Eco selected and no
    "Restart required".
+
+## Loop guard evidence (2026-11-16)
+
+The 11-16 18:39 boot tripped the guard although no Eco boot hung. StrixDgpuGate now records enough to tell the causes apart.
+
+- `strix-gpu-eco-boots` counts Eco claims (written once per boot, in the first `start()`); a second `start()` in the same boot no longer re-arms `strix-gpu-eco-try`.
+- At 90 s awake the gate writes `strix-gpu-eco-cleared = "<counter>:<uptime s>"`, then `strix-gpu-eco-try = 0`, then reads `try` back. The clear repeats at 5 min and on WillRestart / WillPowerOff (only after the first clear).
+- `try=1` is a failed boot only when `cleared` does not name the previous boot's counter; otherwise it is a lost write and is ignored (`gate-try-stale`).
+- Every write of `try` is logged with awake uptime and boot counter. Gate properties: `gate-eco-boots`, `gate-claim-starts`, `gate-try-at-probe`, `gate-prev-boots`, `gate-prev-cleared`, `gate-eco-cleared`, `gate-try-readback`, `gate-try-stale`, `gate-clear-stage`.
+- The read-back is the registry copy of `/options`: it shows the write was accepted, not that it reached flash. Next-boot `gate-prev-*` values are the proof.
