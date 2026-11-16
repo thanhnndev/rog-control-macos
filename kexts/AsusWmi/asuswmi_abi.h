@@ -11,7 +11,9 @@ enum {
     kAsusUcGetState  = 0,   // out: struct, uint32_t[ASUS_ST_COUNT]
     kAsusUcSet       = 1,   // in: scalars { what (ASUS_SET_*), value }
     kAsusUcFanRead   = 2,   // in: scalars { fan (0 cpu, 1 gpu), profile (0 balanced, 1 turbo, 2 silent) }; out: struct 16 bytes
-                            //     (8 temperatures in °C, then 8 fan duties in %): the firmware's curve for that profile
+                            //     (8 temperatures in °C, then 8 fan duties in %): the firmware's curve for that profile. The kext maps the policy value
+                            //     to the firmware's curve index (1 and 2 are swapped there); before 0.3.1 it did not, so
+                            //     turbo returned the silent curve and silent the turbo one
     kAsusUcFanWrite  = 3,   // in: scalars { fan }, struct 16 bytes (same layout): custom curve, makes the fans "manual"
     kAsusUcFanReset  = 4,   // re-applies the current profile: firmware fan curves, power limits back to the profile's
     kAsusUcKey       = 5,   // in: scalars { code }: an Fn key code from the N-KEY keyboard (HID report 0x5A), read by rogkeyd

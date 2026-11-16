@@ -589,11 +589,18 @@ IOReturn AsusWmi::setValue(int what, int v)
     return ok ? kIOReturnSuccess : kIOReturnIOError;
 }
 
-// Firmware curve: DSTS 0x00110024/25 with arg1 = profile returns a 32-byte buffer, 8 temperatures then 8 duties (%).
+// Firmware curve: DSTS 0x00110024/25 with arg1 = curve index returns a 32-byte buffer, 8 temperatures then 8 duties (%).
+// The curve index is NOT the throttle policy value: the firmware numbers its curves 0 balanced, 1 silent, 2 turbo, while
+// 0x00120075 uses 0 balanced, 1 turbo (overboost), 2 silent. Linux asus-wmi swaps the two in fan_curve_get_factory_default
+// ("DEVID_<C/G>PU_FAN_CURVE is switched for OVERBOOST vs SILENT"). Checked on this GA403WM 2026-11-16: index 1 tops out at
+// 78 C / 32 % with an unused 255 C point, index 2 rises to 78 C / 86 %, and in Turbo the fans ran 5900 / 6100 rpm at
+// Tctl 90 C, which only the second curve gives. `profile` here is the throttle policy value (ABI unchanged).
+static uint32_t fanCurveIndex(int profile) { return profile == 1 ? 2u : profile == 2 ? 1u : 0u; }
+
 IOReturn AsusWmi::fanRead(int fan, int profile, uint8_t out[16])
 {
     if (fan < 0 || fan > 1 || profile < 0 || profile > 2) return kIOReturnBadArgument;
-    uint32_t a[5] = { (uint32_t)(fan ? DEV_GPU_CURVE : DEV_CPU_CURVE), (uint32_t)profile, 0, 0, 0 };
+    uint32_t a[5] = { (uint32_t)(fan ? DEV_GPU_CURVE : DEV_CPU_CURVE), fanCurveIndex(profile), 0, 0, 0 };
     OSObject *o = nullptr;
     bool ok = wmiCall(atk, M_DSTS, a, &o);
     OSData *d = o ? OSDynamicCast(OSData, o) : nullptr;
