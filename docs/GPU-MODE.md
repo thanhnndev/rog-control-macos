@@ -19,8 +19,8 @@ next boot**; there is no live switch.
   terminated. Without this, the display-class nub kept an unpublished AppleGPUWrangler record and WindowServer's
   `GPUWranglerWaitForPublish` waited 60 s on every Eco boot (measured 2026-11-19 with 0.2.1: "Server is starting up" ->
   "Creating FB" 3.8 s, was 63.4 s; no wrangler line; GPP9 has no children; debug-gpus lists only the 890M). A pass runs at
-  claim + 3 s, wake + 3 s, a re-claim + 3 s and at the 90 s / 5 min re-check (`gsta-recheck`); after 4 terminate rounds in
-  one boot the nubs are kept (`gate-keepbus-auto`). Keep them by choice: `sudo nvram strix-gpu-keepbus=1` or boot-arg
+  claim + 3 s, wake + 3 s, a re-claim + 3 s and at the 90 s / 5 min re-check (`gsta-recheck`); after 4 terminate rounds within
+  120 s (the count restarts at every wake) the nubs are kept (`gate-keepbus-auto`). Keep them by choice: `sudo nvram strix-gpu-keepbus=1` or boot-arg
   `strixgate_keepbus=1` (costs the 60 s again). Properties: `gate-off-bus`, `gate-offbus-terminations`, `gate-offbus-passes`,
   `gate-offbus-rounds`, `gate-keepbus`, `gate-ws-seen`.
 * `StrixDgpuAccelHold` (IOMatchCategory IOAccelerator, score 1000) takes NVAccel's category in Eco and never registers, so NVAccel's 30 s wait for NVRM never starts. The Eco decision (incl. loop guard) is made once per boot, on the first probe of any personality.

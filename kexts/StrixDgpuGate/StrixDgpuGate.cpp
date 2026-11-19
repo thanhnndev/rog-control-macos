@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause-Clear
 // Copyright (c) 2026 thanhnndev and contributors
 //
-// StrixDgpuGate 0.2.2: "Eco" for the RTX 5060 on the GA403WM under macOS Tahoe 26 (Darwin 25.x).
+// StrixDgpuGate 0.2.3: "Eco" for the RTX 5060 on the GA403WM under macOS Tahoe 26 (Darwin 25.x).
 //
 // The NullMoth NVIDIA stack (NVRM and the kexts that sit on it) binds the RTX at boot and has no runtime power management,
 // so the card can only be powered off when NVRM never attached to it. StrixDgpuClaim matches the RTX with a higher probe
@@ -12,7 +12,9 @@
 // 0.2.1: off-bus is no longer one-shot. Every power-off pass (3 s after the claim, 3 s after each wake, after a second claim
 // in the same boot, and when the 90 s / 5 min re-check finds GPP9.GSTA back at 1 or RTX nubs back on the bus) walks the
 // RTX root port's PCI children, so functions that a hot-plug scan re-created are powered off and terminated again.
-// 0.2.2: at most OFFBUS_MAX_ROUNDS terminate rounds per boot (then the nubs are kept, gate-keepbus-auto); ws1 counts only
+// 0.2.3: the cap counts rounds inside one OFFBUS_WINDOW_S window and restarts at every wake, so one re-creation per wake
+// never trips it; only a card that cycles OFFBUS_MAX_ROUNDS times within OFFBUS_WINDOW_S does.
+// 0.2.2: at most OFFBUS_MAX_ROUNDS terminate rounds (then the nubs are kept, gate-keepbus-auto); ws1 counts only
 // WindowServer's framebuffer / display-pipe user clients.
 // In every other case probe() returns null and NVRM binds as if this kext did not exist.
 //
@@ -67,7 +69,9 @@ static uint32_t gBootN, gClaimStarts, gClearStage, gClearUp;
 static bool gCleared, gStaleTry;
 static char gTryAtProbe[8], gPrevBoots[16], gPrevCleared[32], gClearedStr[32], gTryReadback[8];
 static uint32_t gOffBusTerms, gOffBusPasses, gOffBusRounds, gGstaRecheck = ~0u;
-#define OFFBUS_MAX_ROUNDS 4         // claim + 3 re-creations (each wake can legitimately re-create the nubs once)
+#define OFFBUS_MAX_ROUNDS 4         // terminate rounds within one window before the nubs are kept
+#define OFFBUS_WINDOW_S 120         // window length; also restarted at every wake (each wake may re-create the nubs once)
+static uint32_t gOffBusWinStart;    // awake uptime (s) of the first round in the current window
 static int gWsSeen = -1;            // -1 not checked yet, 0 no WindowServer user client, 1 seen
 static bool gKeepBus, gKeepBusAuto;
 static volatile bool gStopping;
@@ -467,7 +471,7 @@ static IOReturn pmMsg(void *, void *, UInt32 type, IOService *, void *, vm_size_
 {
     // A boot that got past its first clear is a good boot: write the flag again on the way out, so a lost write cannot trip the next one
     if ((type == kIOMessageSystemWillPowerOff || type == kIOMessageSystemWillRestart) && gCleared) clearNow(type == kIOMessageSystemWillRestart ? "will restart" : "will power off");
-    if (type == kIOMessageSystemHasPoweredOn) scheduleOff(3000, "wake");   // a resume may bring the power resource back
+    if (type == kIOMessageSystemHasPoweredOn) { gOffBusRounds = 0; scheduleOff(3000, "wake"); }   // new window per wake   // a resume may bring the power resource back
     return kIOReturnSuccess;
 }
 
@@ -552,12 +556,16 @@ static void takeOffBus(IOPCIDevice **fns, uint32_t n)
 {
     uint32_t done = 0;
     for (uint32_t i = 0; i < n; i++) if (!fns[i]->isInactive() && fns[i]->terminate(kIOServiceRequired)) done++;
-    if (done) gOffBusRounds++;
+    if (done) {
+        uint32_t now = uptimeS();
+        if (gOffBusRounds == 0 || now - gOffBusWinStart > OFFBUS_WINDOW_S) { gOffBusWinStart = now; gOffBusRounds = 0; }
+        gOffBusRounds++;
+    }
     // A platform that keeps re-powering the card would cycle rescan / claim / off / terminate every few seconds. After
-    // OFFBUS_MAX_ROUNDS rounds in one boot, stop terminating: the card is still powered off on every pass, the nubs stay.
+    // OFFBUS_MAX_ROUNDS rounds within OFFBUS_WINDOW_S (no wake in between), stop terminating: the card is still powered off on every pass, the nubs stay.
     if (gOffBusRounds >= OFFBUS_MAX_ROUNDS && !gKeepBus) {
         gKeepBus = gKeepBusAuto = true;
-        IOLog("StrixDgpuGate: eco: RTX nubs re-created %u times this boot: keeping them from now on (gate-keepbus-auto)\n", (unsigned)gOffBusRounds);
+        IOLog("StrixDgpuGate: eco: RTX nubs re-created %u times within %u s: keeping them from now on (gate-keepbus-auto)\n", (unsigned)gOffBusRounds, (unsigned)OFFBUS_WINDOW_S);
     }
     gOffBusTerms += done;
     gOffBus = rtxNubsOnBus() == 0;
