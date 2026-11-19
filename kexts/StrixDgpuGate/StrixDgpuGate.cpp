@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: BSD-3-Clause-Clear
 // Copyright (c) 2026 thanhnndev and contributors
 //
-// StrixDgpuGate 0.1.0: "Eco" for the RTX 5060 on the GA403WM under macOS Tahoe 26 (Darwin 25.x).
+// StrixDgpuGate 0.2.0: "Eco" for the RTX 5060 on the GA403WM under macOS Tahoe 26 (Darwin 25.x).
 //
 // The NullMoth NVIDIA stack (NVRM and the kexts that sit on it) binds the RTX at boot and has no runtime power management,
 // so the card can only be powered off when NVRM never attached to it. StrixDgpuClaim matches the RTX with a higher probe
 // score than NVRM (2000 vs 1000). Its probe() says yes only when the stored GPU mode asks for Eco; then NVRM, NVRMFB,
 // NVAccel and NVRMAGDC never start, and this driver moves the card to D3hot and runs \_SB.PCI0.GPP9.PG00._OFF.
+// 0.2.0: once the card is off, its display and audio nubs are terminated (off the bus). A display-class nub that nothing
+// publishes made WindowServer's GPUWranglerWaitForPublish wait its full 60 s on every Eco boot (see takeOffBus).
 // In every other case probe() returns null and NVRM binds as if this kext did not exist.
 //
 //   NVRAM  strix-gpu-mode = standard | eco | optimized   written by AsusWmi (ABI 6); optimized = Eco only when the boot
@@ -17,6 +19,7 @@
 //                                                        try=1 with cleared == boots is a lost write (stale), not a failed boot.
 //                                                        try is cleared at 90 s, again at 5 min, and on WillRestart / WillPowerOff
 //   boot-args  -strixgate_off      never claim (recovery)
+//              strixgate_keepbus=1 power the card off but leave its nubs registered (0.1.x behaviour; costs 60 s at login)
 //              strixgate_dry=1     claim the card (NVRM stays off) but do not power it off: first-install test
 //
 // Properties of the IOResources service StrixDgpuGate (read by AsusWmi): gate-effective (0 standard, 1 eco),
@@ -25,6 +28,7 @@
 #include <IOKit/IOLib.h>
 #include <IOKit/IODeviceTreeSupport.h>
 #include <IOKit/pci/IOPCIDevice.h>
+#include <IOKit/pci/IOPCIBridge.h>
 #include <IOKit/acpi/IOACPIPlatformDevice.h>
 #include <IOKit/pwr_mgt/RootDomain.h>
 #include <kern/thread_call.h>
@@ -39,7 +43,7 @@
 #define VAR_CLEARED "strix-gpu-eco-cleared"    // "<boot counter>:<awake uptime s>" written just before try is cleared
 
 static void cp(char *d, const char *s, size_t n) { size_t i = 0; for (; i + 1 < n && s[i]; i++) d[i] = s[i]; d[i] = 0; }
-static bool gHeld, gOff, gTripped, gDry;
+static bool gHeld, gOff, gTripped, gDry, gOffBus;
 static int gEffective = 0;
 static uint32_t gSta = ~0u, gGstaBefore = ~0u, gGstaAfter = ~0u, gPsc = ~0u, gVendorAfter = ~0u;
 static char gState[96] = "not probed";
@@ -122,6 +126,7 @@ public:
         setProperty("gate-effective", (unsigned long long)gEffective, 32);
         setProperty("gate-held", gHeld);
         setProperty("gate-powered-off", gOff);
+        setProperty("gate-off-bus", gOffBus);
         setProperty("gate-tripped", gTripped);
         if (gSta != ~0u) setProperty("pg00-sta", (unsigned long long)gSta, 32);
         if (gGstaBefore != ~0u) setProperty("gsta-before", (unsigned long long)gGstaBefore, 32);
@@ -161,38 +166,43 @@ public:
 };
 OSDefineMetaClassAndStructors(StrixDgpuGate, IOService)
 
+// ---- Eco state that outlives the claim ----------------------------------------------------------------------------------
+// After the card is off, the RTX display and audio nubs are terminated ("off the bus", see powerOff). That stops
+// StrixDgpuClaim, so everything that must keep running for the rest of the boot (loop-guard clears, re-off after resume,
+// power-source heartbeat) lives here, not in the claim object. Thread calls take no parameter. Config space is reached through
+// the parent bridge with the nub's saved address, which stays valid after the nub is gone.
+static IOPCIBridge *gBridge;                       // retained; parent of the RTX display function
+static IOPCIAddressSpace gGpuSpace, gAudSpace;
+static bool gHaveAud, gKeepBus;
+static uint8_t gGpuPm, gAudPm;                     // PCI power-management capability offsets, found while the nubs were alive
+static IOPCIDevice *gGpu, *gAud;                   // retained while on the bus; released when terminated
+static thread_call_t gOffCall, gTryCall, gHbCall, gPollCall;
+static IONotifier *gWake, *gAcadNote;
+static IOACPIPlatformDevice *gHbGpp, *gHbPegp;
+static IOService *gBatt;
+static int gBattLast = -1;
+static uint64_t gHbT0, gHbPrev;
+static uint32_t gHbN, gHbSync = 8, gHbLastG = ~0u, gHbVendor = ~0u, gHbPmcsr = ~0u, gHbPsc = ~0u;
+
+static uint16_t cfg16(const IOPCIAddressSpace &sp, uint8_t off) { return gBridge ? gBridge->configRead16(sp, off) : 0xffff; }
+static void cfgW16(const IOPCIAddressSpace &sp, uint8_t off, uint16_t v) { if (gBridge) gBridge->configWrite16(sp, off, v); }
+
+static void offThread(thread_call_param_t, thread_call_param_t);
+static void clearTry(thread_call_param_t, thread_call_param_t);
+static void hbThread(thread_call_param_t, thread_call_param_t);
+static void pollThread(thread_call_param_t, thread_call_param_t);
+static IOReturn pmMsg(void *, void *, UInt32 type, IOService *, void *, vm_size_t);
+static IOReturn acadMsg(void *, void *, UInt32 type, IOService *, void *, vm_size_t);
+
 // ---- the claim -----------------------------------------------------------------------------------------------------------
 class StrixDgpuClaim : public IOService {
     OSDeclareDefaultStructors(StrixDgpuClaim)
 public:
     IOService *probe(IOService *provider, SInt32 *score) override;
     bool start(IOService *provider) override;
-    void stop(IOService *provider) override;
-    thread_call_t offCall = nullptr, tryCall = nullptr;
-    IONotifier *wake = nullptr;
-    IOPCIDevice *gpu = nullptr;
-    // heartbeat
-    thread_call_t hbCall = nullptr, pollCall = nullptr;
-    IONotifier *acadNote = nullptr;
-    IOACPIPlatformDevice *hbGpp = nullptr, *hbPegp = nullptr;
-    IOService *batt = nullptr;
-    int battLast = -1;
-    uint8_t pmCap = 0;
-    bool pmCapDone = false;
-    uint64_t hbT0 = 0, hbPrev = 0;
-    uint32_t hbN = 0, hbSync = 8, hbLastG = ~0u, hbVendor = ~0u, hbPmcsr = ~0u, hbPsc = ~0u;
-    void hbTrigger(const char *src);
-    void hbSample();
-    void hbBattPoll();
-    static void hbThread(thread_call_param_t self, thread_call_param_t) { static_cast<StrixDgpuClaim *>(self)->hbSample(); }
-    static void pollThread(thread_call_param_t self, thread_call_param_t) { static_cast<StrixDgpuClaim *>(self)->hbBattPoll(); }
-    static IOReturn acadMsg(void *target, void *ref, UInt32 type, IOService *, void *, vm_size_t);
-    static void offThread(thread_call_param_t self, thread_call_param_t);
-    static void clearTry(thread_call_param_t self, thread_call_param_t);
-    static IOReturn pmMsg(void *target, void *ref, UInt32 type, IOService *, void *, vm_size_t);
-    void powerOff();
 };
 OSDefineMetaClassAndStructors(StrixDgpuClaim, IOService)
+
 
 static void note(const char *s)
 {
@@ -259,56 +269,72 @@ public:
 };
 OSDefineMetaClassAndStructors(StrixDgpuAccelHold, IOService)
 
+static uint32_t numProp(IORegistryEntry *e, const char *k);
+static IOPCIDevice *findRtxAudio()
+{
+    IOPCIDevice *aud = nullptr;
+    if (OSDictionary *m = IOService::serviceMatching("IOPCIDevice")) {
+        if (OSIterator *it = IOService::getMatchingServices(m)) {
+            while (OSObject *o = it->getNextObject()) {
+                IOPCIDevice *d = OSDynamicCast(IOPCIDevice, o);
+                if (d && (numProp(d, "vendor-id") & 0xffff) == 0x10de && (numProp(d, "class-code") >> 16) == 0x04 && !aud) { aud = d; aud->retain(); }
+            }
+            it->release();
+        }
+        m->release();
+    }
+    return aud;
+}
+
 bool StrixDgpuClaim::start(IOService *provider)
 {
     if (!IOService::start(provider)) return false;
-    gpu = OSDynamicCast(IOPCIDevice, provider);
+    IOPCIDevice *gpu = OSDynamicCast(IOPCIDevice, provider);
     if (!gpu) return false;
-    gpu->retain();
+    if (gClaimStarts++ != 0) {         // once per boot: a second start() must not re-arm anything
+        IOLog("StrixDgpuGate: second Claim start() in this boot (#%u), left alone\n", (unsigned)gClaimStarts);
+        return true;
+    }
+    IOPCIBridge *br = OSDynamicCast(IOPCIBridge, gpu->getProvider());
+    if (!br) { note("eco: RTX has no PCI bridge parent, not held"); return false; }
+    br->retain(); gBridge = br;
+    gpu->retain(); gGpu = gpu; gGpuSpace = gpu->space;
+    uint8_t pm = 0;
+    if (gpu->findPCICapability(kIOPCIPowerManagementCapability, &pm)) gGpuPm = pm;
+    if ((gAud = findRtxAudio())) {
+        gHaveAud = true; gAudSpace = gAud->space;
+        pm = 0;
+        if (gAud->findPCICapability(kIOPCIPowerManagementCapability, &pm)) gAudPm = pm;
+    }
     gHeld = true; gEffective = 1;
-    uint32_t dry = 0;
-    gDry = PE_parse_boot_argn("strixgate_dry", &dry, sizeof dry) && dry == 1;
-    offCall = thread_call_allocate(&StrixDgpuClaim::offThread, this);
-    tryCall = thread_call_allocate(&StrixDgpuClaim::clearTry, this);
+    uint32_t v = 0;
+    gDry = PE_parse_boot_argn("strixgate_dry", &v, sizeof v) && v == 1;
+    v = 0;
+    gKeepBus = PE_parse_boot_argn("strixgate_keepbus", &v, sizeof v) && v == 1;
+    gOffCall = thread_call_allocate(&offThread, nullptr);
+    gTryCall = thread_call_allocate(&clearTry, nullptr);
+    gHbCall = thread_call_allocate(&hbThread, nullptr);
+    gPollCall = thread_call_allocate(&pollThread, nullptr);
     uint64_t dl;
-    if (gClaimStarts++ == 0) {         // once per boot: a second start() must not re-arm the flag without a new clear behind it
-        char b[16];
-        readVar(VAR_BOOTS, b, sizeof b);
-        gBootN = parseU(b) + 1;
-        snprintf(b, sizeof b, "%u", (unsigned)gBootN);
-        writeVar(VAR_BOOTS, b);
-        setTry("1", "Eco claimed");
-        if (tryCall) { clock_interval_to_deadline(90, kSecondScale, &dl); thread_call_enter_delayed(tryCall, dl); }
-    } else IOLog("StrixDgpuGate: second Claim start() in this boot (#%u), %s left alone\n", (unsigned)gClaimStarts, VAR_TRY);
-    if (IOPMrootDomain *rd = getPMRootDomain()) wake = rd->registerInterest(gIOGeneralInterest, &StrixDgpuClaim::pmMsg, this);
-    hbCall = thread_call_allocate(&StrixDgpuClaim::hbThread, this);
-    pollCall = thread_call_allocate(&StrixDgpuClaim::pollThread, this);
+    char b[16];
+    readVar(VAR_BOOTS, b, sizeof b);
+    gBootN = parseU(b) + 1;
+    snprintf(b, sizeof b, "%u", (unsigned)gBootN);
+    writeVar(VAR_BOOTS, b);
+    setTry("1", "Eco claimed");
+    if (gTryCall) { clock_interval_to_deadline(90, kSecondScale, &dl); thread_call_enter_delayed(gTryCall, dl); }
+    if (IOPMrootDomain *rd = getPMRootDomain()) gWake = rd->registerInterest(gIOGeneralInterest, &pmMsg, nullptr);
     if (OSDictionary *am = IOService::nameMatching("ACPI0003")) {
-        if (IOService *ac = IOService::copyMatchingService(am)) { acadNote = ac->registerInterest(gIOGeneralInterest, &StrixDgpuClaim::acadMsg, this); ac->release(); }
+        if (IOService *ac = IOService::copyMatchingService(am)) { gAcadNote = ac->registerInterest(gIOGeneralInterest, &acadMsg, nullptr); ac->release(); }
         am->release();
     }
-    if (pollCall) { clock_interval_to_deadline(1000, kMillisecondScale, &dl); thread_call_enter_delayed(pollCall, dl); }
+    if (gPollCall) { clock_interval_to_deadline(1000, kMillisecondScale, &dl); thread_call_enter_delayed(gPollCall, dl); }
     if (gDry) note("eco: RTX held away from NVRM, dry run (no power off)");
     else {
         note("eco: RTX held away from NVRM, power off in 3 s");
-        if (offCall) { clock_interval_to_deadline(3, kSecondScale, &dl); thread_call_enter_delayed(offCall, dl); }
+        if (gOffCall) { clock_interval_to_deadline(3, kSecondScale, &dl); thread_call_enter_delayed(gOffCall, dl); }
     }
     return true;
-}
-
-void StrixDgpuClaim::stop(IOService *provider)
-{
-    if (wake) { wake->remove(); wake = nullptr; }
-    if (acadNote) { acadNote->remove(); acadNote = nullptr; }
-    if (pollCall) { thread_call_cancel_wait(pollCall); thread_call_free(pollCall); pollCall = nullptr; }
-    if (hbCall) { thread_call_cancel_wait(hbCall); thread_call_free(hbCall); hbCall = nullptr; }
-    if (hbGpp) { hbGpp->release(); hbGpp = nullptr; }
-    if (hbPegp) { hbPegp->release(); hbPegp = nullptr; }
-    if (batt) { batt->release(); batt = nullptr; }
-    if (offCall) { thread_call_cancel_wait(offCall); thread_call_free(offCall); offCall = nullptr; }
-    if (tryCall) { thread_call_cancel_wait(tryCall); thread_call_free(tryCall); tryCall = nullptr; }
-    if (gpu) { gpu->release(); gpu = nullptr; }
-    IOService::stop(provider);
 }
 
 // Stage 0 (90 s awake): record the boot as finished, clear the flag, read it back. Stage 1 (300 s): do it again, in case the
@@ -328,28 +354,25 @@ static void clearNow(const char *why)
     if (gInfo) gInfo->publish();
 }
 
-void StrixDgpuClaim::clearTry(thread_call_param_t p, thread_call_param_t)
+static void clearTry(thread_call_param_t, thread_call_param_t)
 {
-    StrixDgpuClaim *me = static_cast<StrixDgpuClaim *>(p);
     uint32_t st = gClearStage++;
     clearNow(st == 0 ? "clear at 90 s" : "clear again at 5 min");
-    if (st == 0 && me->tryCall) { uint64_t dl; clock_interval_to_deadline(210, kSecondScale, &dl); thread_call_enter_delayed(me->tryCall, dl); }
+    if (st == 0 && gTryCall) { uint64_t dl; clock_interval_to_deadline(210, kSecondScale, &dl); thread_call_enter_delayed(gTryCall, dl); }
 }
 
-IOReturn StrixDgpuClaim::pmMsg(void *target, void *, UInt32 type, IOService *, void *, vm_size_t)
+static IOReturn pmMsg(void *, void *, UInt32 type, IOService *, void *, vm_size_t)
 {
-    StrixDgpuClaim *me = static_cast<StrixDgpuClaim *>(target);
     // A boot that got past its first clear is a good boot: write the flag again on the way out, so a lost write cannot trip the next one
     if ((type == kIOMessageSystemWillPowerOff || type == kIOMessageSystemWillRestart) && gCleared) clearNow(type == kIOMessageSystemWillRestart ? "will restart" : "will power off");
-    if (type == kIOMessageSystemHasPoweredOn && gHeld && !gDry && me->offCall) {   // a resume may bring the power resource back
+    if (type == kIOMessageSystemHasPoweredOn && gHeld && !gDry && gOffCall) {   // a resume may bring the power resource back
         uint64_t dl;
         clock_interval_to_deadline(3, kSecondScale, &dl);
-        thread_call_enter_delayed(me->offCall, dl);
+        thread_call_enter_delayed(gOffCall, dl);
     }
     return kIOReturnSuccess;
 }
 
-void StrixDgpuClaim::offThread(thread_call_param_t self, thread_call_param_t) { static_cast<StrixDgpuClaim *>(self)->powerOff(); }
 
 static uint32_t numProp(IORegistryEntry *e, const char *k)
 {
@@ -400,28 +423,39 @@ static IOReturn nvopDsm(IOACPIPlatformDevice *pegp, uint32_t func, const uint8_t
     return r;
 }
 
-void StrixDgpuClaim::powerOff()
+// Off the bus. GPUWrangler (AppleGPUWrangler.kext) makes a GPU record for every IOPCIDevice whose class-code base class is
+// 03, and GPUWranglerWaitForPublish (WindowServer, before its first framebuffer) sleeps until every record is published,
+// terminated, unsupported or ejecting, for up to 60 s. A record is armed for publication only when an AGDC or an accelerator
+// registers under the GPU; in Eco none ever does, so every Eco boot waited the full 60 s. A card that is powered off is gone
+// from the bus as far as the OS is concerned, so its nubs are terminated: the wrangler marks the record terminated (or never
+// makes one, when this runs before it starts), posts GpuRemoved and wakes the waiter. The audio function goes with it.
+static void takeOffBus()
+{
+    if (gOffBus || gKeepBus) return;
+    gOffBus = true;
+    IOPCIDevice *fns[2] = { gAud, gGpu };
+    gAud = nullptr; gGpu = nullptr;
+    for (IOPCIDevice *d : fns) {
+        if (!d) continue;
+        if (!d->isInactive()) d->terminate(kIOServiceRequired);
+        d->release();
+    }
+    note(gState[0] ? gState : "eco: off the bus");
+    IOLog("StrixDgpuGate: eco: RTX nubs terminated (off the bus)\n");
+}
+
+static void powerOff()
 {
     IORegistryEntry *gppE = IORegistryEntry::fromPath("IOACPIPlane:/_SB/PCI0@0/GPP9@30001");
     IORegistryEntry *pegE = IORegistryEntry::fromPath("IOACPIPlane:/_SB/PCI0@0/GPP9@30001/PEGP@0");
     IOACPIPlatformDevice *gpp = OSDynamicCast(IOACPIPlatformDevice, gppE);
     IOACPIPlatformDevice *pegp = OSDynamicCast(IOACPIPlatformDevice, pegE);
-    IOPCIDevice *aud = nullptr;
-    if (OSDictionary *m = IOService::serviceMatching("IOPCIDevice")) {
-        if (OSIterator *it = IOService::getMatchingServices(m)) {
-            while (OSObject *o = it->getNextObject()) {
-                IOPCIDevice *d = OSDynamicCast(IOPCIDevice, o);
-                if (d && (numProp(d, "vendor-id") & 0xffff) == 0x10de && (numProp(d, "class-code") >> 16) == 0x04 && !aud) { aud = d; aud->retain(); }
-            }
-            it->release();
-        }
-        m->release();
-    }
     const char *why = nullptr;
     if (!gpp) why = "no ACPI GPP9 device";
     else if (!pegp) why = "no ACPI PEGP device";
-    else if (hasForeignChild(gpu)) why = "another driver is attached to the RTX";
-    else if (aud && hasForeignChild(aud)) why = "a driver is attached to the RTX audio function";
+    else if (!gBridge) why = "no PCI bridge";
+    else if (gGpu && hasForeignChild(gGpu)) why = "another driver is attached to the RTX";
+    else if (gAud && hasForeignChild(gAud)) why = "a driver is attached to the RTX audio function";
     else {
         gGstaBefore = evalInt(gpp, "GSTA");
         if (gGstaBefore == 0) { gOff = true; gSta = 0; gGstaAfter = 0; note("eco: RTX already off (GPP9.GSTA 0)"); }
@@ -431,33 +465,28 @@ void StrixDgpuClaim::powerOff()
             IOLog("StrixDgpuGate: NVOP func0 -> %#x bitmap %#x (expect 0x04000001)\n", r0, bm);
             static const uint8_t a3[4] = { 0x01, 0x00, 0x00, 0x03 };   // FLCH=1, OPCE=3
             IOReturn r1 = nvopDsm(pegp, 0x1A, a3, 4, nullptr);
-            IOPCIDevice *fns[2] = { aud, gpu };
-            for (IOPCIDevice *d : fns) {
-                uint8_t pm = 0;
-                if (d && d->findPCICapability(kIOPCIPowerManagementCapability, &pm) && pm) {
-                    uint16_t v = d->configRead16(pm + 4);
-                    d->configWrite16(pm + 4, uint16_t((v & ~0x8003u) | 3));
-                }
-            }
+            if (gHaveAud && gAudPm) { uint16_t v = cfg16(gAudSpace, gAudPm + 4); cfgW16(gAudSpace, gAudPm + 4, uint16_t((v & ~0x8003u) | 3)); }
+            if (gGpuPm) { uint16_t v = cfg16(gGpuSpace, gGpuPm + 4); cfgW16(gGpuSpace, gGpuPm + 4, uint16_t((v & ~0x8003u) | 3)); }
             IOSleep(10);
             IOReturn r2 = pegp->evaluateObject("_PS3");
             gGstaAfter = evalInt(gpp, "GSTA");
             gPsc = evalInt(pegp, "_PSC");
-            gVendorAfter = gpu->configRead16(0);
+            gVendorAfter = cfg16(gGpuSpace, 0);
             gSta = gGstaAfter;
             gOff = gGstaAfter == 0;
             char msg[96];
             snprintf(msg, sizeof msg, "eco: dsm0 %#x dsm1A %#x ps3 %#x gsta %u->%u psc %u vid %#x", r0, r1, r2, (unsigned)gGstaBefore, (unsigned)gGstaAfter, (unsigned)gPsc, (unsigned)gVendorAfter);
             note(msg);
         }
+        if (gOff) takeOffBus();
     }
     if (why) { char msg[96]; snprintf(msg, sizeof msg, "eco: power off refused: %s", why); note(msg); }
     if (gInfo) gInfo->publish();
-    if (aud) aud->release();
     if (pegE) pegE->release();
     if (gppE) gppE->release();
 }
 
+static void offThread(thread_call_param_t, thread_call_param_t) { powerOff(); }
 
 // ---- power-source heartbeat ----------------------------------------------------------------------------------------------
 // Plugging the charger in hard-hung an Eco boot (2026-11-10 09:14). To see what the card/link does around an AC change this
@@ -467,75 +496,75 @@ void StrixDgpuClaim::powerOff()
 //   sampled every 4th tick only. The last 8 samples go into NVRAM "strix-gpu-hb" every tick (no sync) and are committed with a
 //   forced sync at the event, every strix-gpu-hb-sync ticks (default 8 = 2 s; 0 = only start and end) and at the end.
 //   The last 32 samples are also published as property hb-ring for a live check.
-IOReturn StrixDgpuClaim::acadMsg(void *target, void *, UInt32 type, IOService *, void *, vm_size_t)
+static void hbTrigger(const char *src);
+static IOReturn acadMsg(void *, void *, UInt32 type, IOService *, void *, vm_size_t)
 {
-    if (type == kIOACPIMessageDeviceNotification) static_cast<StrixDgpuClaim *>(target)->hbTrigger("acad");
+    if (type == kIOACPIMessageDeviceNotification) hbTrigger("acad");
     return kIOReturnSuccess;
 }
 
-void StrixDgpuClaim::hbBattPoll()
+static void hbBattPoll()
 {
-    if (!batt) {
-        if (OSDictionary *m = IOService::serviceMatching("AppleSmartBattery")) { batt = IOService::copyMatchingService(m); m->release(); }
+    if (!gBatt) {
+        if (OSDictionary *m = IOService::serviceMatching("AppleSmartBattery")) { gBatt = IOService::copyMatchingService(m); m->release(); }
     }
-    if (batt) {
-        OSObject *v = batt->getProperty("ExternalConnected");
+    if (gBatt) {
+        OSObject *v = gBatt->getProperty("ExternalConnected");
         if (v) {
             int ac = v == kOSBooleanTrue ? 1 : 0;
-            if (battLast >= 0 && ac != battLast) { gHbAc = ac; hbTrigger("batt"); }
-            battLast = ac;
+            if (gBattLast >= 0 && ac != gBattLast) { gHbAc = ac; hbTrigger("batt"); }
+            gBattLast = ac;
         }
     }
     uint64_t dl;
     clock_interval_to_deadline(1000, kMillisecondScale, &dl);
-    if (pollCall) thread_call_enter_delayed(pollCall, dl);
+    if (gPollCall) thread_call_enter_delayed(gPollCall, dl);
 }
 
-void StrixDgpuClaim::hbTrigger(const char *src)
+static void hbTrigger(const char *src)
 {
-    if (!hbCall || !OSCompareAndSwap(0, 1, &gHbRunning)) return;       // a run is already sampling
+    if (!gHbCall || !OSCompareAndSwap(0, 1, &gHbRunning)) return;       // a run is already sampling
     gHbEvents++;
     cp(gHbSrc, src, sizeof gHbSrc);
-    if (batt) if (OSObject *v = batt->getProperty("ExternalConnected")) gHbAc = v == kOSBooleanTrue ? 1 : 0;
+    if (gBatt) if (OSObject *v = gBatt->getProperty("ExternalConnected")) gHbAc = v == kOSBooleanTrue ? 1 : 0;
     char sv[8];
-    hbSync = 8;
-    if (readVar("strix-gpu-hb-sync", sv, sizeof sv)) { uint32_t x = 0; for (char *c = sv; *c >= '0' && *c <= '9'; c++) x = x * 10 + (*c - '0'); hbSync = x; }
-    hbN = 0; hbPrev = 0; hbT0 = mach_absolute_time();
-    hbLastG = ~0u; hbVendor = gOff ? gVendorAfter : ~0u; hbPmcsr = ~0u; hbPsc = ~0u;
+    gHbSync = 8;
+    if (readVar("strix-gpu-hb-sync", sv, sizeof sv)) { uint32_t x = 0; for (char *c = sv; *c >= '0' && *c <= '9'; c++) x = x * 10 + (*c - '0'); gHbSync = x; }
+    gHbN = 0; gHbPrev = 0; gHbT0 = mach_absolute_time();
+    gHbLastG = ~0u; gHbVendor = gOff ? gVendorAfter : ~0u; gHbPmcsr = ~0u; gHbPsc = ~0u;
     gHbFlips = 0; gHbFirstFlipMs = ~0u; gHbMaxGapMs = 0;
     uint64_t dl;
     clock_interval_to_deadline(1, kMillisecondScale, &dl);
-    thread_call_enter_delayed(hbCall, dl);
+    thread_call_enter_delayed(gHbCall, dl);
 }
 
-void StrixDgpuClaim::hbSample()
+static void hbSample()
 {
-    if (!hbGpp) { IORegistryEntry *e = IORegistryEntry::fromPath("IOACPIPlane:/_SB/PCI0@0/GPP9@30001"); hbGpp = OSDynamicCast(IOACPIPlatformDevice, e); if (!hbGpp && e) e->release(); }
-    if (!hbPegp) { IORegistryEntry *e = IORegistryEntry::fromPath("IOACPIPlane:/_SB/PCI0@0/GPP9@30001/PEGP@0"); hbPegp = OSDynamicCast(IOACPIPlatformDevice, e); if (!hbPegp && e) e->release(); }
+    if (!gHbGpp) { IORegistryEntry *e = IORegistryEntry::fromPath("IOACPIPlane:/_SB/PCI0@0/GPP9@30001"); gHbGpp = OSDynamicCast(IOACPIPlatformDevice, e); if (!gHbGpp && e) e->release(); }
+    if (!gHbPegp) { IORegistryEntry *e = IORegistryEntry::fromPath("IOACPIPlane:/_SB/PCI0@0/GPP9@30001/PEGP@0"); gHbPegp = OSDynamicCast(IOACPIPlatformDevice, e); if (!gHbPegp && e) e->release(); }
     uint64_t now = mach_absolute_time(), ns;
-    absolutetime_to_nanoseconds(now - hbT0, &ns);
+    absolutetime_to_nanoseconds(now - gHbT0, &ns);
     uint32_t ms = (uint32_t)(ns / 1000000ULL);
-    uint32_t n = hbN++;
-    if (hbPrev) { uint64_t d; absolutetime_to_nanoseconds(now - hbPrev, &d); uint32_t gap = (uint32_t)(d / 1000000ULL); if (gap > gHbMaxGapMs) gHbMaxGapMs = gap; }
-    hbPrev = now;
+    uint32_t n = gHbN++;
+    if (gHbPrev) { uint64_t d; absolutetime_to_nanoseconds(now - gHbPrev, &d); uint32_t gap = (uint32_t)(d / 1000000ULL); if (gap > gHbMaxGapMs) gHbMaxGapMs = gap; }
+    gHbPrev = now;
 
-    uint32_t g = evalInt(hbGpp, "GSTA");
-    if (n && hbLastG != ~0u && g != ~0u && g != hbLastG) { gHbFlips++; if (g == 1 && gHbFirstFlipMs == ~0u) gHbFirstFlipMs = ms; }
-    hbLastG = g;
-    bool deadKnown = g == 0 && hbVendor == 0xffff;                       // never read config of a link known to be down
+    uint32_t g = evalInt(gHbGpp, "GSTA");
+    if (n && gHbLastG != ~0u && g != ~0u && g != gHbLastG) { gHbFlips++; if (g == 1 && gHbFirstFlipMs == ~0u) gHbFirstFlipMs = ms; }
+    gHbLastG = g;
+    bool deadKnown = g == 0 && gHbVendor == 0xffff;                       // never read config of a link known to be down
     if (n % 4 == 0) {
-        if (!deadKnown && gpu) {
-            hbVendor = gpu->configRead16(0);
-            if (!pmCapDone) { pmCapDone = true; uint8_t pm = 0; if (gpu->findPCICapability(kIOPCIPowerManagementCapability, &pm)) pmCap = pm; }
-            hbPmcsr = (hbVendor != 0xffff && pmCap) ? gpu->configRead16(pmCap + 4) : ~0u;
+        if (!deadKnown && gBridge) {
+            gHbVendor = cfg16(gGpuSpace, 0);
+            gHbPmcsr = (gHbVendor != 0xffff && gGpuPm) ? cfg16(gGpuSpace, gGpuPm + 4) : ~0u;
         }
-        hbPsc = evalInt(hbPegp, "_PSC");
+        gHbPsc = evalInt(gHbPegp, "_PSC");
     }
     char buf[44];
     char v[8] = "-", pm[8] = "-", pc[8] = "-";
-    if (hbVendor != ~0u) snprintf(v, sizeof v, "%04x", (unsigned)hbVendor);
-    if (hbPmcsr != ~0u) snprintf(pm, sizeof pm, "%04x", (unsigned)hbPmcsr);
-    if (hbPsc != ~0u) snprintf(pc, sizeof pc, "%u", (unsigned)hbPsc);
+    if (gHbVendor != ~0u) snprintf(v, sizeof v, "%04x", (unsigned)gHbVendor);
+    if (gHbPmcsr != ~0u) snprintf(pm, sizeof pm, "%04x", (unsigned)gHbPmcsr);
+    if (gHbPsc != ~0u) snprintf(pc, sizeof pc, "%u", (unsigned)gHbPsc);
     snprintf(buf, sizeof buf, "T%u n%u g%d v%s p%s c%s", (unsigned)ms, (unsigned)n, g == ~0u ? -1 : (int)g, v, pm, pc);
     cp(gRing[gRingN % HB_RING], buf, sizeof gRing[0]);
     gRingN++;
@@ -552,12 +581,15 @@ void StrixDgpuClaim::hbSample()
         len = strlen(line);
     }
     bool last = n + 1 >= HB_TICKS;
-    bool sync = n == 0 || last || (hbSync && n % hbSync == 0);
+    bool sync = n == 0 || last || (gHbSync && n % gHbSync == 0);
     writeVar("strix-gpu-hb", line, sync);
     if (gInfo) { gInfo->publish(); gInfo->publishRing(); }
 
     if (last) { OSCompareAndSwap(1, 0, &gHbRunning); return; }
     uint64_t dl;
     clock_interval_to_deadline(250, kMillisecondScale, &dl);
-    thread_call_enter_delayed(hbCall, dl);
+    thread_call_enter_delayed(gHbCall, dl);
 }
+
+static void hbThread(thread_call_param_t, thread_call_param_t) { hbSample(); }
+static void pollThread(thread_call_param_t, thread_call_param_t) { hbBattPoll(); }
