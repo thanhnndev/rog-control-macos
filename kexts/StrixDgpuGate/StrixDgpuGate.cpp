@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause-Clear
 // Copyright (c) 2026 thanhnndev and contributors
 //
-// StrixDgpuGate 0.2.1: "Eco" for the RTX 5060 on the GA403WM under macOS Tahoe 26 (Darwin 25.x).
+// StrixDgpuGate 0.2.2: "Eco" for the RTX 5060 on the GA403WM under macOS Tahoe 26 (Darwin 25.x).
 //
 // The NullMoth NVIDIA stack (NVRM and the kexts that sit on it) binds the RTX at boot and has no runtime power management,
 // so the card can only be powered off when NVRM never attached to it. StrixDgpuClaim matches the RTX with a higher probe
@@ -12,6 +12,8 @@
 // 0.2.1: off-bus is no longer one-shot. Every power-off pass (3 s after the claim, 3 s after each wake, after a second claim
 // in the same boot, and when the 90 s / 5 min re-check finds GPP9.GSTA back at 1 or RTX nubs back on the bus) walks the
 // RTX root port's PCI children, so functions that a hot-plug scan re-created are powered off and terminated again.
+// 0.2.2: at most OFFBUS_MAX_ROUNDS terminate rounds per boot (then the nubs are kept, gate-keepbus-auto); ws1 counts only
+// WindowServer's framebuffer / display-pipe user clients.
 // In every other case probe() returns null and NVRM binds as if this kext did not exist.
 //
 // AsusWmi: with the nubs gone, its rtxForeignDriver() finds no RTX, so ASUS_GPF_LIVE_OK stays clear and ASUS_GPU_SET_DGPU
@@ -25,8 +27,8 @@
 //   NVRAM  strix-gpu-eco-boots / strix-gpu-eco-cleared    evidence: Eco boot counter; "<counter>:<awake s>" written before try is cleared.
 //                                                        try=1 with cleared == boots is a lost write (stale), not a failed boot.
 //                                                        try is cleared at 90 s, again at 5 min, and on WillRestart / WillPowerOff.
-//                                                        0.2.1: cleared = "<counter>:<awake s>:ws<0|1>", ws1 = a WindowServer
-//                                                        user client existed at the last clear (the desktop came up)
+//                                                        0.2.1: cleared = "<counter>:<awake s>:ws<0|1>", ws1 = WindowServer had a
+//                                                        framebuffer or display-pipe user client at the last clear
 //   NVRAM  strix-gpu-keepbus = 1                          same as strixgate_keepbus=1 (sudo nvram strix-gpu-keepbus=1; -d to undo)
 //   boot-args  -strixgate_off      never claim (recovery)
 //              strixgate_keepbus=1 power the card off but leave its nubs registered (0.1.x behaviour; costs 60 s at login)
@@ -64,9 +66,10 @@ static char gState[96] = "not probed";
 static uint32_t gBootN, gClaimStarts, gClearStage, gClearUp;
 static bool gCleared, gStaleTry;
 static char gTryAtProbe[8], gPrevBoots[16], gPrevCleared[32], gClearedStr[32], gTryReadback[8];
-static uint32_t gOffBusTerms, gOffBusPasses, gGstaRecheck = ~0u;
+static uint32_t gOffBusTerms, gOffBusPasses, gOffBusRounds, gGstaRecheck = ~0u;
+#define OFFBUS_MAX_ROUNDS 4         // claim + 3 re-creations (each wake can legitimately re-create the nubs once)
 static int gWsSeen = -1;            // -1 not checked yet, 0 no WindowServer user client, 1 seen
-static bool gKeepBus;
+static bool gKeepBus, gKeepBusAuto;
 static volatile bool gStopping;
 // power-source heartbeat (see hbTick): last 32 samples, event counters
 #define HB_RING 32
@@ -147,6 +150,8 @@ public:
         setProperty("gate-offbus-terminations", (unsigned long long)gOffBusTerms, 32);
         setProperty("gate-offbus-passes", (unsigned long long)gOffBusPasses, 32);
         setProperty("gate-keepbus", gKeepBus);
+        setProperty("gate-keepbus-auto", gKeepBusAuto);
+        setProperty("gate-offbus-rounds", (unsigned long long)gOffBusRounds, 32);
         if (gGstaRecheck != ~0u) setProperty("gsta-recheck", (unsigned long long)gGstaRecheck, 32);
         if (gWsSeen >= 0) setProperty("gate-ws-seen", gWsSeen == 1);
         setProperty("gate-tripped", gTripped);
@@ -214,10 +219,12 @@ void StrixDgpuGate::stop(IOService *provider)
     if (gWake) { gWake->remove(); gWake = nullptr; }
     if (gAcadNote) { gAcadNote->remove(); gAcadNote = nullptr; }
     thread_call_t *calls[4] = { &gOffCall, &gTryCall, &gHbCall, &gPollCall };
+    // quiesce all four before freeing any: clearTry schedules gOffCall, pollThread schedules gHbCall
+    for (thread_call_t *c : calls) if (*c) thread_call_cancel_wait(*c);
+    for (thread_call_t *c : calls) if (*c) thread_call_cancel_wait(*c);   // invocations that re-entered before they saw gStopping
     for (thread_call_t *c : calls) {
         if (!*c) continue;
-        thread_call_cancel_wait(*c);
-        thread_call_cancel(*c);            // an invocation that re-entered itself before it saw gStopping
+        thread_call_cancel(*c);
         thread_call_free(*c);
         *c = nullptr;
     }
@@ -329,7 +336,8 @@ bool StrixDgpuClaim::start(IOService *provider)
     if (!IOService::start(provider)) return false;
     IOPCIDevice *gpu = OSDynamicCast(IOPCIDevice, provider);
     if (!gpu) return false;
-    if (gClaimStarts++ != 0) {
+    if (gClaimStarts != 0) {
+        gClaimStarts++;
         // Once per boot for everything that arms state. A second claim means the RTX display function was enumerated again
         // (a hot-plug scan after GPP9 came back to D0 can re-create the nubs): run a power-off pass, which walks GPP9's children.
         IOLog("StrixDgpuGate: second Claim start() in this boot (#%u)\n", (unsigned)gClaimStarts);
@@ -341,6 +349,7 @@ bool StrixDgpuClaim::start(IOService *provider)
     IOPCIBridge *br = OSDynamicCast(IOPCIBridge, gpu->getProvider());
     if (!br) { note("eco: RTX has no PCI bridge parent, not held"); return false; }
     if (!(gOffLock = IOLockAlloc())) { note("eco: no memory for the power-off lock, not held"); return false; }
+    gClaimStarts = 1;                  // counted only once the claim is armed; a failed first start leaves the next one free
     br->retain(); gBridge = br;
     gGpuSpace = gpu->space;            // the PM capability offsets are found in the first power-off pass (powerOff)
     gHeld = true; gEffective = 1;
@@ -396,6 +405,16 @@ static void clearNow(const char *why)
 // accelerator user clients right after GPUWranglerWaitForPublish). One registry walk at each clear stage; written into
 // strix-gpu-eco-cleared as ws0/ws1 so the next boot can tell "kernel lived 90 s" from "the desktop came up".
 static bool contains(const char *s, const char *w) { for (; *s; s++) { size_t i = 0; while (w[i] && s[i] == w[i]) i++; if (!w[i]) return true; } return false; }
+// Only clients WindowServer opens after the wrangler wait (it holds AppleGPUWranglerClient, IOHID and RootDomain clients
+// before or during it): the framebuffer and the display pipe.
+static bool isDisplayClient(IORegistryEntry *e)
+{
+    for (const OSMetaClass *m = e->getMetaClass(); m; m = m->getSuperClass()) {
+        const char *n = m->getClassName();
+        if (!strcmp(n, "IOFramebufferUserClient") || !strcmp(n, "IOAccelDisplayPipeUserClient2")) return true;
+    }
+    return false;
+}
 static int windowServerSeen()
 {
     IORegistryIterator *it = IORegistryIterator::iterateOver(gIOServicePlane, kIORegistryIterateRecursively);
@@ -404,7 +423,7 @@ static int windowServerSeen()
     for (uint32_t n = 0; n < 50000; n++) {
         IORegistryEntry *e = it->getNextObject();
         if (!e) { if (it->isValid()) break; it->reset(); continue; }   // the registry changed under the walk: start again
-        if (!OSDynamicCast(IOUserClient, e)) continue;
+        if (!OSDynamicCast(IOUserClient, e) || !isDisplayClient(e)) continue;
         if (OSString *cr = OSDynamicCast(OSString, e->getProperty("IOUserClientCreator"))) if (contains(cr->getCStringNoCopy(), "WindowServer")) { seen = 1; break; }
     }
     it->release();
@@ -412,11 +431,18 @@ static int windowServerSeen()
 }
 
 static uint32_t evalInt(IOACPIPlatformDevice *d, const char *name);
-static IOACPIPlatformDevice *gpp9()
+// clearTry and the heartbeat both look these up lazily from different thread calls: publish with a compare-and-swap so
+// the loser releases its reference instead of leaking it
+static IOACPIPlatformDevice *lazyAcpi(IOACPIPlatformDevice *volatile *slot, const char *path)
 {
-    if (!gHbGpp) { IORegistryEntry *e = IORegistryEntry::fromPath("IOACPIPlane:/_SB/PCI0@0/GPP9@30001"); gHbGpp = OSDynamicCast(IOACPIPlatformDevice, e); if (!gHbGpp && e) e->release(); }
-    return gHbGpp;
+    if (*slot) return *slot;
+    IORegistryEntry *e = IORegistryEntry::fromPath(path);
+    IOACPIPlatformDevice *d = OSDynamicCast(IOACPIPlatformDevice, e);
+    if (!d) { if (e) e->release(); return nullptr; }
+    if (!OSCompareAndSwapPtr(nullptr, d, (void *volatile *)slot)) d->release();
+    return *slot;
 }
+static IOACPIPlatformDevice *gpp9() { return lazyAcpi(&gHbGpp, "IOACPIPlane:/_SB/PCI0@0/GPP9@30001"); }
 static uint32_t rtxNubsOnBus();
 
 static void clearTry(thread_call_param_t, thread_call_param_t)
@@ -526,6 +552,13 @@ static void takeOffBus(IOPCIDevice **fns, uint32_t n)
 {
     uint32_t done = 0;
     for (uint32_t i = 0; i < n; i++) if (!fns[i]->isInactive() && fns[i]->terminate(kIOServiceRequired)) done++;
+    if (done) gOffBusRounds++;
+    // A platform that keeps re-powering the card would cycle rescan / claim / off / terminate every few seconds. After
+    // OFFBUS_MAX_ROUNDS rounds in one boot, stop terminating: the card is still powered off on every pass, the nubs stay.
+    if (gOffBusRounds >= OFFBUS_MAX_ROUNDS && !gKeepBus) {
+        gKeepBus = gKeepBusAuto = true;
+        IOLog("StrixDgpuGate: eco: RTX nubs re-created %u times this boot: keeping them from now on (gate-keepbus-auto)\n", (unsigned)gOffBusRounds);
+    }
     gOffBusTerms += done;
     gOffBus = rtxNubsOnBus() == 0;
     IOLog("StrixDgpuGate: eco: %u RTX nub(s) terminated (%u this boot), off the bus %s\n", (unsigned)done, (unsigned)gOffBusTerms, gOffBus ? "yes" : "NO");
@@ -588,7 +621,7 @@ static void powerOff()
             if (gVendorAfter == 0xffff) takeOffBus(fns, nf);
             else IOLog("StrixDgpuGate: eco: GSTA 0 but the RTX still answers (vendor %#x): nubs kept\n", (unsigned)gVendorAfter);
         }
-        if (!nf) gOffBus = true;
+        gOffBus = rtxNubsOnBus() == 0;     // count now, not the snapshot from the start of the pass
     }
     if (why) { char msg[96]; snprintf(msg, sizeof msg, "eco: power off refused: %s", why); note(msg); }
     for (uint32_t i = 0; i < nf; i++) fns[i]->release();
@@ -652,8 +685,8 @@ static void hbTrigger(const char *src)
 
 static void hbSample()
 {
-    if (!gHbGpp) { IORegistryEntry *e = IORegistryEntry::fromPath("IOACPIPlane:/_SB/PCI0@0/GPP9@30001"); gHbGpp = OSDynamicCast(IOACPIPlatformDevice, e); if (!gHbGpp && e) e->release(); }
-    if (!gHbPegp) { IORegistryEntry *e = IORegistryEntry::fromPath("IOACPIPlane:/_SB/PCI0@0/GPP9@30001/PEGP@0"); gHbPegp = OSDynamicCast(IOACPIPlatformDevice, e); if (!gHbPegp && e) e->release(); }
+    gpp9();
+    lazyAcpi(&gHbPegp, "IOACPIPlane:/_SB/PCI0@0/GPP9@30001/PEGP@0");
     uint64_t now = mach_absolute_time(), ns;
     absolutetime_to_nanoseconds(now - gHbT0, &ns);
     uint32_t ms = (uint32_t)(ns / 1000000ULL);

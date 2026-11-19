@@ -15,6 +15,14 @@ next boot**; there is no live switch.
 * When it claims: NVRM and everything above it never start. After 3 s it puts the RTX and its audio function in D3hot (PMCSR)
   and runs the firmware Optimus path: PEGP `_DSM` (NVOP GUID, func 0x1A, Arg3 01 00 00 03 sets OMPR=3), PMCSR D3hot on both functions, PEGP `_PS3` (which runs PG00._OFF); re-run after wake if GPP9.GSTA reads 1. Published: `gsta-before`, `gsta-after`, `psc`, `vendor-after`, refusing if any other driver
   sits on either function. After a system wake it re-checks and repeats.
+* Off the bus (0.2.0+): once GPP9.GSTA reads 0 and the display function reads vendor 0xffff, every RTX function under GPP9 is
+  terminated. Without this, the display-class nub kept an unpublished AppleGPUWrangler record and WindowServer's
+  `GPUWranglerWaitForPublish` waited 60 s on every Eco boot (measured 2026-11-19 with 0.2.1: "Server is starting up" ->
+  "Creating FB" 3.8 s, was 63.4 s; no wrangler line; GPP9 has no children; debug-gpus lists only the 890M). A pass runs at
+  claim + 3 s, wake + 3 s, a re-claim + 3 s and at the 90 s / 5 min re-check (`gsta-recheck`); after 4 terminate rounds in
+  one boot the nubs are kept (`gate-keepbus-auto`). Keep them by choice: `sudo nvram strix-gpu-keepbus=1` or boot-arg
+  `strixgate_keepbus=1` (costs the 60 s again). Properties: `gate-off-bus`, `gate-offbus-terminations`, `gate-offbus-passes`,
+  `gate-offbus-rounds`, `gate-keepbus`, `gate-ws-seen`.
 * `StrixDgpuAccelHold` (IOMatchCategory IOAccelerator, score 1000) takes NVAccel's category in Eco and never registers, so NVAccel's 30 s wait for NVRM never starts. The Eco decision (incl. loop guard) is made once per boot, on the first probe of any personality.
 * Eco never uses `-nvoff` or `nullmoth-remove` (those park NMXGPU/NMXAGDC too).
 * Status service `StrixDgpuGate` (IOResources): `gate-effective`, `gate-held`, `gate-powered-off`, `gate-tripped`, `pg00-sta`, `gate-state`.
@@ -29,7 +37,9 @@ next boot**; there is no live switch.
 DSDT WMNB `DEVS 0x00090020`=1 runs `EC.PREC=1`, `Notify(PEGP,0x81)`, **`Notify(PEGP,0x03)` (eject request)**, waits `WAT1`
 (up to 15 s) and sets `EC.PWMD=0` (cuts the card's rail); 0 does the reverse. That would pull power under NVRM, and the EC state
 survives a warm reboot, so a later Standard boot could find the card unpowered. `ASUS_GPU_SET_DGPU` therefore is allowed only
-when the RTX is provably held by the gate and has no other driver (`ASUS_GPF_LIVE_OK`); the app never calls it. MUX
+when the RTX is provably held by the gate and has no other driver (`ASUS_GPF_LIVE_OK`); the app never calls it. Once the gate has
+taken the RTX off the bus, AsusWmi finds no RTX nub, so `ASUS_GPF_LIVE_OK` stays clear and `SET_DGPU` answers NotPermitted.
+The GPU-mode tile is unaffected: it reads the gate's properties and stores the next-boot mode with `SET_MODE`, which is always allowed. MUX
 (`0x00090016`) set needs boot-arg `asuswmi_mux=1`; it would hand the panel to the RTX while WindowServer runs on the 890M. Ultimate is
 disabled in the UI.
 
