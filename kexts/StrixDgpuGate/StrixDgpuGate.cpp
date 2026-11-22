@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause-Clear
 // Copyright (c) 2026 thanhnndev and contributors
 //
-// StrixDgpuGate 0.2.5: "Eco" for the RTX 5060 on the GA403WM under macOS Tahoe 26 (Darwin 25.x).
+// StrixDgpuGate 0.2.6: "Eco" for the RTX 5060 on the GA403WM under macOS Tahoe 26 (Darwin 25.x).
 //
 // The NullMoth NVIDIA stack (NVRM and the kexts that sit on it) binds the RTX at boot and has no runtime power management,
 // so the card can only be powered off when NVRM never attached to it. StrixDgpuClaim matches the RTX with a higher probe
@@ -16,6 +16,10 @@
 // never trips it; only a card that cycles OFFBUS_MAX_ROUNDS times within OFFBUS_WINDOW_S does.
 // 0.2.2: at most OFFBUS_MAX_ROUNDS terminate rounds (then the nubs are kept, gate-keepbus-auto); ws1 counts only
 // WindowServer's framebuffer / display-pipe user clients.
+// 0.2.6: every wake runs a read-only re-check 3 s after HasPoweredOn (GSTA + RTX nubs; a pass only if the card came back),
+// whatever strixgate_wakereoff says; a pass cancelled or skipped by sleep is run again at the wake; a card that is powered
+// but does not answer config reads is retried 3 times 5 s apart (with RTX nubs on the bus) or powered off (no nubs: nothing
+// in macOS uses it, the idle bridge is why config reads fail); gSleeping heals itself 60 s awake after WillSleep.
 // In every other case probe() returns null and NVRM binds as if this kext did not exist.
 //
 // AsusWmi: with the nubs gone, its rtxForeignDriver() finds no RTX, so ASUS_GPF_LIVE_OK stays clear and ASUS_GPU_SET_DGPU
@@ -38,8 +42,9 @@
 //   NVRAM  strix-gpu-keepbus = 1                          same as strixgate_keepbus=1 (sudo nvram strix-gpu-keepbus=1; -d to undo)
 //   NVRAM  strix-gpu-wake-reoff = 1                      same as strixgate_wakereoff=1
 //   boot-args  -strixgate_off      never claim (recovery)
-//              strixgate_wakereoff=1 run a power-off pass 3 s after each wake (0.2.5: default off; the 90 s / 5 min re-checks
-//                                  catch a card that came back). Name audited: only NMXGPU's unrelated -nmxfbwakeoff is close
+//              strixgate_wakereoff=1 run an unconditional power-off pass 3 s after each wake (default off since 0.2.5; the
+//                                  wake re-check of 0.2.6 runs either way and starts a pass when the card came back).
+//                                  Name audited: only NMXGPU's unrelated -nmxfbwakeoff is close
 //              strixgate_keepbus=1 power the card off but leave its nubs registered (0.1.x behaviour; costs 60 s at login)
 //              strixgate_dry=1     claim the card (NVRM stays off) but do not power it off: first-install test
 //
@@ -84,6 +89,9 @@ static bool gKeepBus, gKeepBusAuto;
 static volatile bool gStopping;
 static bool gWakeReoff;              // strixgate_wakereoff=1 / strix-gpu-wake-reoff=1: power-off pass 3 s after a wake (default off)
 static volatile bool gSleeping;      // between WillSleep and HasPoweredOn / WillNotSleep: no power-off pass runs
+static uint32_t gSleepAtUp;          // awake uptime at the last WillSleep: gSleeping is ignored 60 s (awake) after it
+static volatile bool gOffPending;    // a pass was cancelled or skipped because of sleep: run it at the wake
+static uint32_t gDeferRetries, gDeferTotal, gSleepHeals, gPendingRuns;
 static volatile bool gRoundsResetPending;   // set by the wake message, consumed under gOffLock
 static uint32_t gWakeMsgs, gSleepMsgs, gLastWakeUp, gGoodPolls;
 static IOLock *gClearLock;           // clearNow runs from the clear thread call and from the shutdown message
@@ -187,7 +195,17 @@ public:
         if (gTryAtProbe[0]) setProperty("gate-try-at-probe", gTryAtProbe);
         if (gPrevBoots[0]) setProperty("gate-prev-boots", gPrevBoots);
         if (gPrevCleared[0]) setProperty("gate-prev-cleared", gPrevCleared);
-        if (gClearedStr[0]) setProperty("gate-eco-cleared", gClearedStr);
+        {
+            char cs[sizeof gClearedStr];   // clearNow writes it under gClearLock (and calls publish only after unlocking)
+            if (gClearLock) IOLockLock(gClearLock);
+            memcpy(cs, gClearedStr, sizeof cs);
+            if (gClearLock) IOLockUnlock(gClearLock);
+            cs[sizeof cs - 1] = 0;
+            if (cs[0]) setProperty("gate-eco-cleared", cs);
+        }
+        setProperty("gate-defer-retries", (unsigned long long)gDeferTotal, 32);
+        setProperty("gate-sleep-heals", (unsigned long long)gSleepHeals, 32);
+        setProperty("gate-pending-runs", (unsigned long long)gPendingRuns, 32);
         if (gTryReadback[0]) setProperty("gate-try-readback", gTryReadback);
         setProperty("gate-clear-stage", (unsigned long long)gClearStage, 32);
         setProperty("hb-events", (unsigned long long)gHbEvents, 32);
@@ -223,7 +241,7 @@ static IOPCIAddressSpace gGpuSpace, gAudSpace;
 static bool gHaveAud;
 static uint8_t gGpuPm, gAudPm;                     // PCI power-management capability offsets, found while the card was powered
 static IOLock *gOffLock;                           // one power-off pass at a time (wake, re-check and a second claim can overlap)
-static thread_call_t gOffCall, gTryCall, gHbCall, gPollCall;
+static thread_call_t gOffCall, gTryCall, gHbCall, gPollCall, gWakeChkCall;
 static IONotifier *gWake, *gAcadNote;
 static IOACPIPlatformDevice *gHbGpp, *gHbPegp;
 static IOService *gBatt;
@@ -238,8 +256,8 @@ void StrixDgpuGate::stop(IOService *provider)
     gStopping = true;
     if (gWake) { gWake->remove(); gWake = nullptr; }
     if (gAcadNote) { gAcadNote->remove(); gAcadNote = nullptr; }
-    thread_call_t *calls[4] = { &gOffCall, &gTryCall, &gHbCall, &gPollCall };
-    // quiesce all four before freeing any: clearTry schedules gOffCall, pollThread schedules gHbCall
+    thread_call_t *calls[5] = { &gOffCall, &gTryCall, &gHbCall, &gPollCall, &gWakeChkCall };
+    // quiesce all five before freeing any: clearTry and wakeCheck schedule gOffCall, pollThread schedules gHbCall
     for (thread_call_t *c : calls) if (*c) thread_call_cancel_wait(*c);
     for (thread_call_t *c : calls) if (*c) thread_call_cancel_wait(*c);   // invocations that re-entered before they saw gStopping
     for (thread_call_t *c : calls) {
@@ -262,6 +280,7 @@ static uint16_t cfg16(const IOPCIAddressSpace &sp, uint8_t off) { return gBridge
 static void cfgW16(const IOPCIAddressSpace &sp, uint8_t off, uint16_t v) { if (gBridge) gBridge->configWrite16(sp, off, v); }
 
 static void offThread(thread_call_param_t, thread_call_param_t);
+static void wakeCheck(thread_call_param_t, thread_call_param_t);
 static void clearTry(thread_call_param_t, thread_call_param_t);
 static void scheduleTry(uint32_t s);
 static void hbThread(thread_call_param_t, thread_call_param_t);
@@ -389,6 +408,7 @@ bool StrixDgpuClaim::start(IOService *provider)
     gTryCall = thread_call_allocate(&clearTry, nullptr);
     gHbCall = thread_call_allocate(&hbThread, nullptr);
     gPollCall = thread_call_allocate(&pollThread, nullptr);
+    gWakeChkCall = thread_call_allocate(&wakeCheck, nullptr);
     uint64_t dl;
     char b[16];
     readVar(VAR_BOOTS, b, sizeof b);
@@ -401,7 +421,8 @@ bool StrixDgpuClaim::start(IOService *provider)
     // kIOMessageSystemWillPowerOff / WillRestart only to gIOPriorityPowerStateInterest, so the general-interest notifier of
     // 0.1.x-0.2.3 (registerSleepWakeInterest is the same thing) never saw a shutdown and never cleared the flag there.
     // Sleep/wake messages (IOService::tellClients) go to priority, app and general interest alike: the old notifier did get
-    // HasPoweredOn; the wake re-off it triggered has simply never been observed here (now behind strixgate_wakereoff).
+    // HasPoweredOn (IOPMrootDomain::tellChangeUp sends 0xe0000300 through tellClients) and ran a pass 3 s after each wake.
+    // 0.2.6: each wake runs the read-only re-check (wakeCheck); strixgate_wakereoff adds the old unconditional pass.
     gWake = registerPrioritySleepWakeInterest(&pmMsg, nullptr);
     if (OSDictionary *am = IOService::nameMatching("ACPI0003")) {
         if (IOService *ac = IOService::copyMatchingService(am)) { gAcadNote = ac->registerInterest(gIOGeneralInterest, &acadMsg, nullptr); ac->release(); }
@@ -481,15 +502,22 @@ static uint32_t rtxNubsOnBus();
 
 // Re-check the card: once GPP9 has no children IOPCIFamily may idle it and the platform may turn PG00 back on through
 // GPP9._PR0 / _PR3 without a sleep. Also catches re-created nubs.
+static bool sleepingNow();
 static void recheck(const char *when)
 {
-    if (!gHeld || gDry) return;
+    if (!gHeld || gDry || gStopping) return;
+    if (sleepingNow()) { gOffPending = true; IOLog("StrixDgpuGate: re-check (%s) skipped: system going to sleep, pass at the wake\n", when); return; }
     gGstaRecheck = evalInt(gpp9(), "GSTA");
     uint32_t nubs = gKeepBus ? 0 : rtxNubsOnBus();
     IOLog("StrixDgpuGate: re-check (%s): GPP9.GSTA %u, RTX nubs on the bus %u, WindowServer %d\n", when, (unsigned)gGstaRecheck, (unsigned)nubs, gWsSeen);
     if (gInfo) gInfo->publish();
-    if (gGstaRecheck == 1 || nubs) scheduleOff(1000, gGstaRecheck == 1 ? "re-check: GPP9 powered again" : "re-check: RTX nubs back");
+    if (gGstaRecheck == 1 || nubs) {
+        gDeferRetries = 0;       // a new trigger gets its own deferred-pass retries
+        scheduleOff(1000, gGstaRecheck == 1 ? "re-check: GPP9 powered again" : "re-check: RTX nubs back");
+    }
 }
+
+static void wakeCheck(thread_call_param_t, thread_call_param_t) { recheck("wake"); }
 
 static void scheduleTry(uint32_t s)
 {
@@ -532,22 +560,32 @@ static IOReturn pmMsg(void *, void *, UInt32 type, IOService *, void *, vm_size_
     // the flag at any uptime (0.2.3 and earlier cleared here only after the 90 s clear, so a shutdown at T+35 s tripped the
     // next boot). A boot whose WindowServer never got a display (e.g. shut down over ssh from a hung desktop) keeps try=1.
     if ((type == kIOMessageSystemWillPowerOff || type == kIOMessageSystemWillRestart) && gHeld) {
+        // latch here too: a shutdown within 5 s of WindowServer's first display comes before the next poll would latch it.
+        // windowServerSeen() is a registry walk (no NVRAM, no ACPI), safe on the PM thread that delivers this message.
         if (gWsSeen != 1 && windowServerSeen() == 1) gWsSeen = 1;
         if (gWsSeen == 1) clearNow(type == kIOMessageSystemWillRestart ? "will restart" : "will power off");
         else IOLog("StrixDgpuGate: %s without a WindowServer display: %s stays 1\n", type == kIOMessageSystemWillRestart ? "restart" : "power off", VAR_TRY);
     }
     if (type == kIOMessageSystemWillSleep) {
         // no power-off pass during the sleep transition: cancel a pending one and wait out a running one
-        gSleeping = true; gSleepMsgs++;
-        if (gOffCall) thread_call_cancel(gOffCall);
+        gSleepAtUp = uptimeS(); gSleeping = true; gSleepMsgs++;
+        if (gOffCall && thread_call_cancel(gOffCall)) { gOffPending = true; IOLog("StrixDgpuGate: pending power-off pass cancelled by sleep: runs at the wake\n"); }
+        if (gWakeChkCall) thread_call_cancel(gWakeChkCall);   // the next HasPoweredOn schedules it again
         if (gOffLock) { IOLockLock(gOffLock); IOLockUnlock(gOffLock); }
     }
-    if (type == kIOMessageSystemWillNotSleep) gSleeping = false;
+    if (type == kIOMessageSystemWillNotSleep) {
+        gSleeping = false;
+        if (gOffPending) { gOffPending = false; gPendingRuns++; scheduleOff(1000, "pass dropped by a sleep that did not happen"); }
+    }
     if (type == kIOMessageSystemHasPoweredOn) {
         gSleeping = false; gWakeMsgs++; gLastWakeUp = uptimeS();
         IOLog("StrixDgpuGate: HasPoweredOn #%u at awake uptime %u s, wake re-off %s\n", (unsigned)gWakeMsgs, (unsigned)gLastWakeUp, gWakeReoff ? "on" : "off");
         gRoundsResetPending = true;                       // new terminate-round window per wake
-        if (gWakeReoff) scheduleOff(3000, "wake");        // default off: never observed here; the 90 s / 5 min re-checks catch a card that came back
+        gDeferRetries = 0;
+        if (gOffPending) { gOffPending = false; gPendingRuns++; scheduleOff(3000, "pass dropped by sleep"); }
+        else if (gWakeReoff) scheduleOff(3000, "wake");   // unconditional pass (0.2.3 behaviour), default off
+        // always: read-only re-check 3 s after the wake; it starts a pass only when GSTA is 1 or RTX nubs are back
+        if (gWakeChkCall && !gStopping) { uint64_t dl; clock_interval_to_deadline(3000, kMillisecondScale, &dl); thread_call_enter_delayed(gWakeChkCall, dl); }
         if (gInfo) gInfo->publish();
     }
     return kIOReturnSuccess;
@@ -651,11 +689,25 @@ static void takeOffBus(IOPCIDevice **fns, uint32_t n)
     IOLog("StrixDgpuGate: eco: %u RTX nub(s) terminated (%u this boot), off the bus %s\n", (unsigned)done, (unsigned)gOffBusTerms, gOffBus ? "yes" : "NO");
 }
 
+// gSleeping with self-heal: mach_absolute_time does not run while asleep, so 60 s of awake uptime after WillSleep means the
+// system is awake and the HasPoweredOn / WillNotSleep that should have cleared the flag never reached us.
+static bool sleepingNow()
+{
+    if (!gSleeping) return false;
+    uint32_t up = uptimeS();
+    if (up - gSleepAtUp < 60) return true;
+    gSleeping = false; gSleepHeals++;
+    IOLog("StrixDgpuGate: sleep flag set at awake uptime %u s still set at %u s with no wake message: cleared\n", (unsigned)gSleepAtUp, (unsigned)up);
+    return false;
+}
+
 static void powerOff()
 {
-    if (!gOffLock || gStopping || gSleeping) return;
+    if (!gOffLock || gStopping) return;
+    if (sleepingNow()) { gOffPending = true; IOLog("StrixDgpuGate: power-off pass skipped: system going to sleep, runs at the wake\n"); return; }
     IOLockLock(gOffLock);
-    if (gSleeping) { IOLockUnlock(gOffLock); IOLog("StrixDgpuGate: power-off pass skipped: system going to sleep\n"); return; }
+    if (sleepingNow()) { gOffPending = true; IOLockUnlock(gOffLock); IOLog("StrixDgpuGate: power-off pass skipped: system going to sleep, runs at the wake\n"); return; }
+    bool retry = false, deferred = false;
     gOffBusPasses++;
     IORegistryEntry *gppE = IORegistryEntry::fromPath("IOACPIPlane:/_SB/PCI0@0/GPP9@30001");
     IORegistryEntry *pegE = IORegistryEntry::fromPath("IOACPIPlane:/_SB/PCI0@0/GPP9@30001/PEGP@0");
@@ -676,12 +728,26 @@ static void powerOff()
             // confirms the link is down before terminating (no read at all when nothing is left to terminate)
             if (nf) gVendorAfter = cfg16(gGpuSpace, 0);
             note("eco: RTX already off (GPP9.GSTA 0)");
-        } else if (cfg16(gGpuSpace, 0) == 0xffff) {
-            // GSTA says powered but the display function does not answer config reads: the bridge or link is not restored yet
-            // (e.g. just after a wake). D3hot could not be written, and _PS3 would cut the rail on a card in D0: run nothing,
-            // the 90 s / 5 min re-check (or the next pass) tries again.
-            note("eco: GPP9.GSTA 1 but the RTX does not answer config reads: power-off deferred");
+            gDeferRetries = 0;
+        } else if (nf && cfg16(gGpuSpace, 0) == 0xffff) {
+            // GSTA says powered, RTX nubs are on the bus, and the display function does not answer config reads: the bridge or
+            // link is not restored yet (e.g. just after a wake). D3hot could not be written, and _PS3 would cut the rail on a
+            // card that may be in D0 with live nubs: run nothing now, try again 5 s later, 3 times per trigger.
+            // The card is NOT off: gate-powered-off / takeOffBus must not act on an earlier pass's values.
+            gOff = false; gSta = 1; gGstaAfter = 1; gVendorAfter = ~0u;
+            gDeferTotal++;
+            deferred = true;
+            retry = gDeferRetries < 3;
+            char msg[96];
+            snprintf(msg, sizeof msg, "eco: GPP9.GSTA 1, RTX not answering config reads: deferred (%u, %s)", (unsigned)(gDeferRetries + 1), gDeferRetries < 3 ? "retry in 5 s" : "no retry left");
+            note(msg);
+            gDeferRetries++;
         } else {
+            // with no RTX nub on the bus a 0xffff config read is the idled GPP9 bridge (no children, platform re-powered PG00
+            // through _PR0/_PR3): nothing in macOS uses the card, so _DSM + _PS3 run as in 0.2.3 (the D3hot writes below skip
+            // functions that read 0xffff)
+            if (!nf && cfg16(gGpuSpace, 0) == 0xffff) IOLog("StrixDgpuGate: eco: GPP9.GSTA 1, no RTX nubs, config reads 0xffff (idle bridge): _DSM + _PS3\n");
+            gDeferRetries = 0;
             // the card is powered, so config space answers: (re)learn each function's address and PM capability
             for (uint32_t i = 0; i < nf; i++) {
                 uint32_t cls = numProp(fns[i], "class-code") >> 16, ven = numProp(fns[i], "vendor-id") & 0xffff;
@@ -722,6 +788,9 @@ static void powerOff()
     if (pegE) pegE->release();
     if (gppE) gppE->release();
     IOLockUnlock(gOffLock);
+    if (retry) scheduleOff(5000, "deferred: RTX not answering config reads");
+    else if (deferred)
+        IOLog("StrixDgpuGate: eco: deferred 3 times: card left powered until the next re-check or wake\n");
 }
 
 static void offThread(thread_call_param_t, thread_call_param_t) { powerOff(); }
