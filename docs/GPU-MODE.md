@@ -54,16 +54,18 @@ disabled in the UI.
   WillPowerOff / WillRestart only to `gIOPriorityPowerStateInterest`, while `IOService::tellClients` (sleep/wake messages)
   goes to priority, app and general interest alike. So shutdown never reached the gate, but HasPoweredOn did. 0.2.4+ uses
   `registerPrioritySleepWakeInterest`.
-* Wake (0.2.6): 3 s after every HasPoweredOn a read-only re-check reads GPP9.GSTA and counts RTX nubs; it starts a pass
-  only when GSTA is 1 or nubs are back. Evidence that the wake message arrives: `IOPMrootDomain::tellChangeUp` sends
+* Wake (0.2.6, 0.2.7): 3 s after every HasPoweredOn a read-only re-check reads GPP9.GSTA and counts RTX nubs; it starts a
+  pass only when GSTA is 1 or nubs are back. When a pass is already due at the wake (dropped by sleep, or the wake re-off
+  switch) that pass runs instead of the re-check, so one wake queues one pass. Evidence that the wake message arrives: `IOPMrootDomain::tellChangeUp` sends
   0xe0000300 (HasPoweredOn) through `IOService::tellClients`, which applies priority, app and general interest, so 0.2.3's
   general-interest notifier also got it and ran a pass at every full wake. The switch `strixgate_wakereoff=1` /
   `sudo nvram strix-gpu-wake-reoff=1` (default off since 0.2.5) only adds that unconditional pass. No pass runs between
   WillSleep and HasPoweredOn / WillNotSleep; a pass cancelled or skipped then is run at the wake (`gate-pending-runs`). The
-  sleep flag clears itself 60 s of awake uptime after WillSleep if no wake message came (`gate-sleep-heals`).
+  sleep flag clears itself 180 s of awake uptime after WillSleep if no wake message came (`gate-sleep-heals`).
   A pass that finds GSTA 1 but the card not answering config reads: with RTX nubs on the bus it runs nothing (no `_PS3` on a
   card that may be in D0 with live nubs), marks the card on (`gate-powered-off` false) and retries 3 times 5 s apart per
-  trigger (`gate-defer-retries` counts deferrals); after that the card stays on until the next re-check or wake. With no
+  trigger (`gate-defer-retries` counts deferrals); after that (or when `_PS3` left GSTA at 1) a slow pass runs every 5 min
+  until the card is off (0.2.7). With no
   nubs (idled GPP9 bridge, PG00 re-powered by the platform) it runs `_DSM` + `_PS3` as 0.2.3 did. Properties `gate-wake-msgs`, `gate-sleep-msgs`,
   `gate-last-wake-uptime`, `gate-wake-reoff` show whether the messages arrive. Still trips (by design): forced power-off, panic or power loss before the
   boot finished.
