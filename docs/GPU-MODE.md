@@ -45,8 +45,13 @@ disabled in the UI.
 
 ## Failure modes
 * IOACPIPlatformDevice evaluate* rejects dotted paths (kIOReturnBadArgument, seen on the first real boot): every call is a single NameSeg on the owning device (GSTA on GPP9; _DSM/_PS3/_PSC on PEGP). Power-off itself is still untested end to end: a hang or panic is possible.  (StrixS0ix 0.1.16 same path, also not installed): a hang or panic is possible. Guard: Eco claim sets
-  `strix-gpu-eco-try=1`, cleared after 90 s; if still 1 at the next boot the gate stands down once (RTX to NVRM) and reports `gate-tripped`. A normal
-  shutdown within 90 s of an Eco boot also trips it (safe direction).
+  `strix-gpu-eco-try=1`, cleared as soon as the boot has finished (RTX off and WindowServer's display client up, polled from
+  10 s; 90 s at the latest) and on every clean shut down / restart; if still 1 at the next boot the gate stands down once
+  (RTX to NVRM) and reports `gate-tripped`. Until 0.2.3 a clean shutdown before the 90 s clear tripped the next boot
+  (2026-11-20 11:07: shut down at T+35 s, 11-22 came up in Standard): the shutdown clear required the 90 s clear first, and
+  the root-domain notifier was general interest, which never receives WillPowerOff / WillRestart (or the wake message).
+  0.2.4 uses `registerPrioritySleepWakeInterest`. Still trips (by design): forced power-off, panic or power loss before the
+  boot finished.
 * Gate kext missing/not loaded: Eco is stored but has no effect; the app warns and shows "StrixDgpuGate not loaded".
 * NVRAM write refused/not persisted (OpenCore emulated NVRAM without LegacySchema): app shows the old mode after re-read.
   Other kexts already persist plain-named vars (`nmxgpu-stage`), so native NVRAM is assumed.

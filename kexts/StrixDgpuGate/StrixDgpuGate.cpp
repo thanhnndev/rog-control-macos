@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause-Clear
 // Copyright (c) 2026 thanhnndev and contributors
 //
-// StrixDgpuGate 0.2.3: "Eco" for the RTX 5060 on the GA403WM under macOS Tahoe 26 (Darwin 25.x).
+// StrixDgpuGate 0.2.4: "Eco" for the RTX 5060 on the GA403WM under macOS Tahoe 26 (Darwin 25.x).
 //
 // The NullMoth NVIDIA stack (NVRM and the kexts that sit on it) binds the RTX at boot and has no runtime power management,
 // so the card can only be powered off when NVRM never attached to it. StrixDgpuClaim matches the RTX with a higher probe
@@ -28,7 +28,10 @@
 //                                                        the next probe = the last Eco boot did not finish: stand down once
 //   NVRAM  strix-gpu-eco-boots / strix-gpu-eco-cleared    evidence: Eco boot counter; "<counter>:<awake s>" written before try is cleared.
 //                                                        try=1 with cleared == boots is a lost write (stale), not a failed boot.
-//                                                        try is cleared at 90 s, again at 5 min, and on WillRestart / WillPowerOff.
+//                                                        0.2.4: try is cleared as soon as the boot has finished (RTX off and a
+//                                                        WindowServer display client up; polled from 10 s), at 90 s at the
+//                                                        latest, again at 5 min, and on every WillRestart / WillPowerOff
+//                                                        (priority sleep/wake interest, at any uptime).
 //                                                        0.2.1: cleared = "<counter>:<awake s>:ws<0|1>", ws1 = WindowServer had a
 //                                                        framebuffer or display-pipe user client at the last clear
 //   NVRAM  strix-gpu-keepbus = 1                          same as strixgate_keepbus=1 (sudo nvram strix-gpu-keepbus=1; -d to undo)
@@ -246,6 +249,7 @@ static void cfgW16(const IOPCIAddressSpace &sp, uint8_t off, uint16_t v) { if (g
 
 static void offThread(thread_call_param_t, thread_call_param_t);
 static void clearTry(thread_call_param_t, thread_call_param_t);
+static void scheduleTry(uint32_t s);
 static void hbThread(thread_call_param_t, thread_call_param_t);
 static void pollThread(thread_call_param_t, thread_call_param_t);
 static IOReturn pmMsg(void *, void *, UInt32 type, IOService *, void *, vm_size_t);
@@ -373,8 +377,11 @@ bool StrixDgpuClaim::start(IOService *provider)
     snprintf(b, sizeof b, "%u", (unsigned)gBootN);
     writeVar(VAR_BOOTS, b);
     setTry("1", "Eco claimed");
-    if (gTryCall) { clock_interval_to_deadline(90, kSecondScale, &dl); thread_call_enter_delayed(gTryCall, dl); }
-    if (IOPMrootDomain *rd = getPMRootDomain()) gWake = rd->registerInterest(gIOGeneralInterest, &pmMsg, nullptr);
+    scheduleTry(10);                   // first look for "boot finished" at 10 s; cleared at 90 s at the latest
+    // Priority sleep/wake interest: IOPMrootDomain sends kIOMessageSystemWillPowerOff / WillRestart (handlePlatformHaltRestart)
+    // and the sleep/wake messages to these clients. A general-interest notifier on the root domain gets none of them, which
+    // is why 0.1.x-0.2.3 never cleared the flag at shutdown and never re-ran the power-off after a wake.
+    gWake = registerPrioritySleepWakeInterest(&pmMsg, nullptr);
     if (OSDictionary *am = IOService::nameMatching("ACPI0003")) {
         if (IOService *ac = IOService::copyMatchingService(am)) { gAcadNote = ac->registerInterest(gIOGeneralInterest, &acadMsg, nullptr); ac->release(); }
         am->release();
@@ -449,28 +456,54 @@ static IOACPIPlatformDevice *lazyAcpi(IOACPIPlatformDevice *volatile *slot, cons
 static IOACPIPlatformDevice *gpp9() { return lazyAcpi(&gHbGpp, "IOACPIPlane:/_SB/PCI0@0/GPP9@30001"); }
 static uint32_t rtxNubsOnBus();
 
+// Re-check the card: once GPP9 has no children IOPCIFamily may idle it and the platform may turn PG00 back on through
+// GPP9._PR0 / _PR3 without a sleep. Also catches re-created nubs.
+static void recheck(const char *when)
+{
+    if (!gHeld || gDry) return;
+    gGstaRecheck = evalInt(gpp9(), "GSTA");
+    uint32_t nubs = gKeepBus ? 0 : rtxNubsOnBus();
+    IOLog("StrixDgpuGate: re-check (%s): GPP9.GSTA %u, RTX nubs on the bus %u, WindowServer %d\n", when, (unsigned)gGstaRecheck, (unsigned)nubs, gWsSeen);
+    if (gInfo) gInfo->publish();
+    if (gGstaRecheck == 1 || nubs) scheduleOff(1000, gGstaRecheck == 1 ? "re-check: GPP9 powered again" : "re-check: RTX nubs back");
+}
+
+static void scheduleTry(uint32_t s)
+{
+    if (!gTryCall || gStopping) return;
+    uint64_t dl;
+    clock_interval_to_deadline(s ? s : 1, kSecondScale, &dl);
+    thread_call_enter_delayed(gTryCall, dl);
+}
+
+// The boot has finished when the card is off (or this is a dry run) and WindowServer has its display: that is the point
+// a hang in the Eco path can no longer happen, so the flag is cleared then, not at a fixed time.
+// Stage 0: from 10 s, every 5 s: clear as soon as the boot has finished, or at 90 s at the latest. Stage 1 -> 2: the 90 s
+// re-check (skipped when the first clear was the 90 s one). Stage 3: the 5 min clear and re-check.
 static void clearTry(thread_call_param_t, thread_call_param_t)
 {
-    uint32_t st = gClearStage++;
+    uint32_t up = uptimeS();
     int ws = windowServerSeen();
-    if (ws >= 0 && gWsSeen != 1) gWsSeen = ws;
-    clearNow(st == 0 ? "clear at 90 s" : "clear again at 5 min");
-    // Re-check the card: only the wake path re-ran the power-off before, but once GPP9 has no children IOPCIFamily may idle
-    // it and the platform may turn PG00 back on through GPP9._PR0 / _PR3 without a sleep. Also catches re-created nubs.
-    if (gHeld && !gDry) {
-        gGstaRecheck = evalInt(gpp9(), "GSTA");
-        uint32_t nubs = gKeepBus ? 0 : rtxNubsOnBus();
-        IOLog("StrixDgpuGate: re-check (%s): GPP9.GSTA %u, RTX nubs on the bus %u, WindowServer %d\n", st == 0 ? "90 s" : "5 min", (unsigned)gGstaRecheck, (unsigned)nubs, gWsSeen);
-        if (gInfo) gInfo->publish();
-        if (gGstaRecheck == 1 || nubs) scheduleOff(1000, gGstaRecheck == 1 ? "re-check: GPP9 powered again" : "re-check: RTX nubs back");
+    if (ws == 1) gWsSeen = 1; else if (ws == 0 && gWsSeen < 0) gWsSeen = 0;
+    if (gClearStage == 0) {
+        bool finished = gWsSeen == 1 && (gDry || gOff);
+        if (!finished && up < 90) { scheduleTry(5); return; }
+        gClearStage = 1;
+        clearNow(finished ? "boot finished: RTX off, WindowServer display up" : "clear at 90 s");
+        if (up >= 90) { gClearStage = 2; recheck("90 s"); }
+        else recheck("boot finished");
+        scheduleTry(up < 90 ? 90 - up : (up < 300 ? 300 - up : 1));
+        return;
     }
-    if (st == 0 && gTryCall && !gStopping) { uint64_t dl; clock_interval_to_deadline(210, kSecondScale, &dl); thread_call_enter_delayed(gTryCall, dl); }
+    if (gClearStage == 1) { gClearStage = 2; recheck("90 s"); scheduleTry(up < 300 ? 300 - up : 1); return; }
+    if (gClearStage == 2) { gClearStage = 3; clearNow("clear again at 5 min"); recheck("5 min"); }
 }
 
 static IOReturn pmMsg(void *, void *, UInt32 type, IOService *, void *, vm_size_t)
 {
-    // A boot that got past its first clear is a good boot: write the flag again on the way out, so a lost write cannot trip the next one
-    if ((type == kIOMessageSystemWillPowerOff || type == kIOMessageSystemWillRestart) && gCleared) clearNow(type == kIOMessageSystemWillRestart ? "will restart" : "will power off");
+    // A clean shut down or restart was requested from a running system, so this Eco boot did not hang: clear the flag at any
+    // uptime (0.2.3 and earlier cleared here only after the 90 s clear, so a shutdown at T+35 s tripped the next boot).
+    if ((type == kIOMessageSystemWillPowerOff || type == kIOMessageSystemWillRestart) && gHeld) clearNow(type == kIOMessageSystemWillRestart ? "will restart" : "will power off");
     if (type == kIOMessageSystemHasPoweredOn) { gOffBusRounds = 0; scheduleOff(3000, "wake"); }   // new window per wake   // a resume may bring the power resource back
     return kIOReturnSuccess;
 }
