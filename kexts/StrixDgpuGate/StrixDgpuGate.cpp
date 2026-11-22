@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause-Clear
 // Copyright (c) 2026 thanhnndev and contributors
 //
-// StrixDgpuGate 0.2.4: "Eco" for the RTX 5060 on the GA403WM under macOS Tahoe 26 (Darwin 25.x).
+// StrixDgpuGate 0.2.5: "Eco" for the RTX 5060 on the GA403WM under macOS Tahoe 26 (Darwin 25.x).
 //
 // The NullMoth NVIDIA stack (NVRM and the kexts that sit on it) binds the RTX at boot and has no runtime power management,
 // so the card can only be powered off when NVRM never attached to it. StrixDgpuClaim matches the RTX with a higher probe
@@ -28,14 +28,18 @@
 //                                                        the next probe = the last Eco boot did not finish: stand down once
 //   NVRAM  strix-gpu-eco-boots / strix-gpu-eco-cleared    evidence: Eco boot counter; "<counter>:<awake s>" written before try is cleared.
 //                                                        try=1 with cleared == boots is a lost write (stale), not a failed boot.
-//                                                        0.2.4: try is cleared as soon as the boot has finished (RTX off and a
-//                                                        WindowServer display client up; polled from 10 s), at 90 s at the
-//                                                        latest, again at 5 min, and on every WillRestart / WillPowerOff
-//                                                        (priority sleep/wake interest, at any uptime).
+//                                                        0.2.5: try is cleared once the boot has finished (RTX off AND off the
+//                                                        bus, or keepbus / dry run, AND a WindowServer display client, on two
+//                                                        5 s polls in a row, not before 30 s), at 90 s at the latest, again at
+//                                                        5 min, and on every WillRestart / WillPowerOff (priority interest, any
+//                                                        uptime) if WindowServer's display was ever seen.
 //                                                        0.2.1: cleared = "<counter>:<awake s>:ws<0|1>", ws1 = WindowServer had a
 //                                                        framebuffer or display-pipe user client at the last clear
 //   NVRAM  strix-gpu-keepbus = 1                          same as strixgate_keepbus=1 (sudo nvram strix-gpu-keepbus=1; -d to undo)
+//   NVRAM  strix-gpu-wake-reoff = 1                      same as strixgate_wakereoff=1
 //   boot-args  -strixgate_off      never claim (recovery)
+//              strixgate_wakereoff=1 run a power-off pass 3 s after each wake (0.2.5: default off; the 90 s / 5 min re-checks
+//                                  catch a card that came back). Name audited: only NMXGPU's unrelated -nmxfbwakeoff is close
 //              strixgate_keepbus=1 power the card off but leave its nubs registered (0.1.x behaviour; costs 60 s at login)
 //              strixgate_dry=1     claim the card (NVRM stays off) but do not power it off: first-install test
 //
@@ -78,6 +82,11 @@ static uint32_t gOffBusWinStart;    // awake uptime (s) of the first round in th
 static int gWsSeen = -1;            // -1 not checked yet, 0 no WindowServer user client, 1 seen
 static bool gKeepBus, gKeepBusAuto;
 static volatile bool gStopping;
+static bool gWakeReoff;              // strixgate_wakereoff=1 / strix-gpu-wake-reoff=1: power-off pass 3 s after a wake (default off)
+static volatile bool gSleeping;      // between WillSleep and HasPoweredOn / WillNotSleep: no power-off pass runs
+static volatile bool gRoundsResetPending;   // set by the wake message, consumed under gOffLock
+static uint32_t gWakeMsgs, gSleepMsgs, gLastWakeUp, gGoodPolls;
+static IOLock *gClearLock;           // clearNow runs from the clear thread call and from the shutdown message
 // power-source heartbeat (see hbTick): last 32 samples, event counters
 #define HB_RING 32
 #define HB_TICKS 80                 // 80 x 250 ms = 20 s
@@ -158,6 +167,10 @@ public:
         setProperty("gate-offbus-passes", (unsigned long long)gOffBusPasses, 32);
         setProperty("gate-keepbus", gKeepBus);
         setProperty("gate-keepbus-auto", gKeepBusAuto);
+        setProperty("gate-wake-reoff", gWakeReoff);
+        setProperty("gate-wake-msgs", (unsigned long long)gWakeMsgs, 32);
+        setProperty("gate-sleep-msgs", (unsigned long long)gSleepMsgs, 32);
+        if (gLastWakeUp) setProperty("gate-last-wake-uptime", (unsigned long long)gLastWakeUp, 32);
         setProperty("gate-offbus-rounds", (unsigned long long)gOffBusRounds, 32);
         if (gGstaRecheck != ~0u) setProperty("gsta-recheck", (unsigned long long)gGstaRecheck, 32);
         if (gWsSeen >= 0) setProperty("gate-ws-seen", gWsSeen == 1);
@@ -240,6 +253,7 @@ void StrixDgpuGate::stop(IOService *provider)
     if (gHbPegp) { gHbPegp->release(); gHbPegp = nullptr; }
     if (gBridge) { gBridge->release(); gBridge = nullptr; }
     if (gOffLock) { IOLockFree(gOffLock); gOffLock = nullptr; }
+    if (gClearLock) { IOLockFree(gClearLock); gClearLock = nullptr; }
     gInfo = nullptr;
     IOService::stop(provider);
 }
@@ -356,7 +370,10 @@ bool StrixDgpuClaim::start(IOService *provider)
     }
     IOPCIBridge *br = OSDynamicCast(IOPCIBridge, gpu->getProvider());
     if (!br) { note("eco: RTX has no PCI bridge parent, not held"); return false; }
-    if (!(gOffLock = IOLockAlloc())) { note("eco: no memory for the power-off lock, not held"); return false; }
+    if (!(gOffLock = IOLockAlloc()) || !(gClearLock = IOLockAlloc())) {
+        if (gOffLock) { IOLockFree(gOffLock); gOffLock = nullptr; }
+        note("eco: no memory for the locks, not held"); return false;
+    }
     gClaimStarts = 1;                  // counted only once the claim is armed; a failed first start leaves the next one free
     br->retain(); gBridge = br;
     gGpuSpace = gpu->space;            // the PM capability offsets are found in the first power-off pass (powerOff)
@@ -366,6 +383,8 @@ bool StrixDgpuClaim::start(IOService *provider)
     v = 0;
     char kb[4];
     gKeepBus = (PE_parse_boot_argn("strixgate_keepbus", &v, sizeof v) && v == 1) || (readVar("strix-gpu-keepbus", kb, sizeof kb) && kb[0] == '1');
+    v = 0;
+    gWakeReoff = (PE_parse_boot_argn("strixgate_wakereoff", &v, sizeof v) && v == 1) || (readVar("strix-gpu-wake-reoff", kb, sizeof kb) && kb[0] == '1');
     gOffCall = thread_call_allocate(&offThread, nullptr);
     gTryCall = thread_call_allocate(&clearTry, nullptr);
     gHbCall = thread_call_allocate(&hbThread, nullptr);
@@ -378,9 +397,11 @@ bool StrixDgpuClaim::start(IOService *provider)
     writeVar(VAR_BOOTS, b);
     setTry("1", "Eco claimed");
     scheduleTry(10);                   // first look for "boot finished" at 10 s; cleared at 90 s at the latest
-    // Priority sleep/wake interest: IOPMrootDomain sends kIOMessageSystemWillPowerOff / WillRestart (handlePlatformHaltRestart)
-    // and the sleep/wake messages to these clients. A general-interest notifier on the root domain gets none of them, which
-    // is why 0.1.x-0.2.3 never cleared the flag at shutdown and never re-ran the power-off after a wake.
+    // Priority sleep/wake interest. Checked in the 25G332 kernel: IOPMrootDomain::handlePlatformHaltRestart sends
+    // kIOMessageSystemWillPowerOff / WillRestart only to gIOPriorityPowerStateInterest, so the general-interest notifier of
+    // 0.1.x-0.2.3 (registerSleepWakeInterest is the same thing) never saw a shutdown and never cleared the flag there.
+    // Sleep/wake messages (IOService::tellClients) go to priority, app and general interest alike: the old notifier did get
+    // HasPoweredOn; the wake re-off it triggered has simply never been observed here (now behind strixgate_wakereoff).
     gWake = registerPrioritySleepWakeInterest(&pmMsg, nullptr);
     if (OSDictionary *am = IOService::nameMatching("ACPI0003")) {
         if (IOService *ac = IOService::copyMatchingService(am)) { gAcadNote = ac->registerInterest(gIOGeneralInterest, &acadMsg, nullptr); ac->release(); }
@@ -400,6 +421,7 @@ bool StrixDgpuClaim::start(IOService *provider)
 // reached flash; gate-eco-cleared and gate-try-readback on the next boot are the proof.
 static void clearNow(const char *why)
 {
+    if (gClearLock) IOLockLock(gClearLock);
     char c[32];
     gClearUp = uptimeS();
     snprintf(c, sizeof c, "%u:%u:ws%d", (unsigned)gBootN, (unsigned)gClearUp, gWsSeen == 1 ? 1 : 0);
@@ -409,6 +431,7 @@ static void clearNow(const char *why)
     readVar(VAR_TRY, gTryReadback, sizeof gTryReadback);
     IOLog("StrixDgpuGate: %s read back %s (%s)\n", VAR_TRY, gTryReadback[0] ? gTryReadback : "(none)", why);
     gCleared = true;
+    if (gClearLock) IOLockUnlock(gClearLock);
     if (gInfo) gInfo->publish();
 }
 
@@ -486,7 +509,11 @@ static void clearTry(thread_call_param_t, thread_call_param_t)
     int ws = windowServerSeen();
     if (ws == 1) gWsSeen = 1; else if (ws == 0 && gWsSeen < 0) gWsSeen = 0;
     if (gClearStage == 0) {
-        bool finished = gWsSeen == 1 && (gDry || gOff);
+        // finished = the whole Eco path has run: card off and off the bus (or nubs kept by choice, or a dry run) AND WindowServer
+        // has its display, on two polls in a row, and not before 30 s (0.2.4 cleared on gOff alone, before takeOffBus ran)
+        bool good = gWsSeen == 1 && (gDry || (gOff && (gOffBus || gKeepBus)));
+        gGoodPolls = good ? gGoodPolls + 1 : 0;
+        bool finished = gGoodPolls >= 2 && up >= 30;
         if (!finished && up < 90) { scheduleTry(5); return; }
         gClearStage = 1;
         clearNow(finished ? "boot finished: RTX off, WindowServer display up" : "clear at 90 s");
@@ -501,10 +528,28 @@ static void clearTry(thread_call_param_t, thread_call_param_t)
 
 static IOReturn pmMsg(void *, void *, UInt32 type, IOService *, void *, vm_size_t)
 {
-    // A clean shut down or restart was requested from a running system, so this Eco boot did not hang: clear the flag at any
-    // uptime (0.2.3 and earlier cleared here only after the 90 s clear, so a shutdown at T+35 s tripped the next boot).
-    if ((type == kIOMessageSystemWillPowerOff || type == kIOMessageSystemWillRestart) && gHeld) clearNow(type == kIOMessageSystemWillRestart ? "will restart" : "will power off");
-    if (type == kIOMessageSystemHasPoweredOn) { gOffBusRounds = 0; scheduleOff(3000, "wake"); }   // new window per wake   // a resume may bring the power resource back
+    // A clean shut down or restart requested from a running system whose desktop came up: this Eco boot did not hang, clear
+    // the flag at any uptime (0.2.3 and earlier cleared here only after the 90 s clear, so a shutdown at T+35 s tripped the
+    // next boot). A boot whose WindowServer never got a display (e.g. shut down over ssh from a hung desktop) keeps try=1.
+    if ((type == kIOMessageSystemWillPowerOff || type == kIOMessageSystemWillRestart) && gHeld) {
+        if (gWsSeen != 1 && windowServerSeen() == 1) gWsSeen = 1;
+        if (gWsSeen == 1) clearNow(type == kIOMessageSystemWillRestart ? "will restart" : "will power off");
+        else IOLog("StrixDgpuGate: %s without a WindowServer display: %s stays 1\n", type == kIOMessageSystemWillRestart ? "restart" : "power off", VAR_TRY);
+    }
+    if (type == kIOMessageSystemWillSleep) {
+        // no power-off pass during the sleep transition: cancel a pending one and wait out a running one
+        gSleeping = true; gSleepMsgs++;
+        if (gOffCall) thread_call_cancel(gOffCall);
+        if (gOffLock) { IOLockLock(gOffLock); IOLockUnlock(gOffLock); }
+    }
+    if (type == kIOMessageSystemWillNotSleep) gSleeping = false;
+    if (type == kIOMessageSystemHasPoweredOn) {
+        gSleeping = false; gWakeMsgs++; gLastWakeUp = uptimeS();
+        IOLog("StrixDgpuGate: HasPoweredOn #%u at awake uptime %u s, wake re-off %s\n", (unsigned)gWakeMsgs, (unsigned)gLastWakeUp, gWakeReoff ? "on" : "off");
+        gRoundsResetPending = true;                       // new terminate-round window per wake
+        if (gWakeReoff) scheduleOff(3000, "wake");        // default off: never observed here; the 90 s / 5 min re-checks catch a card that came back
+        if (gInfo) gInfo->publish();
+    }
     return kIOReturnSuccess;
 }
 
@@ -589,6 +634,7 @@ static void takeOffBus(IOPCIDevice **fns, uint32_t n)
 {
     uint32_t done = 0;
     for (uint32_t i = 0; i < n; i++) if (!fns[i]->isInactive() && fns[i]->terminate(kIOServiceRequired)) done++;
+    if (gRoundsResetPending) { gRoundsResetPending = false; gOffBusRounds = 0; }
     if (done) {
         uint32_t now = uptimeS();
         if (gOffBusRounds == 0 || now - gOffBusWinStart > OFFBUS_WINDOW_S) { gOffBusWinStart = now; gOffBusRounds = 0; }
@@ -607,8 +653,9 @@ static void takeOffBus(IOPCIDevice **fns, uint32_t n)
 
 static void powerOff()
 {
-    if (!gOffLock || gStopping) return;
+    if (!gOffLock || gStopping || gSleeping) return;
     IOLockLock(gOffLock);
+    if (gSleeping) { IOLockUnlock(gOffLock); IOLog("StrixDgpuGate: power-off pass skipped: system going to sleep\n"); return; }
     gOffBusPasses++;
     IORegistryEntry *gppE = IORegistryEntry::fromPath("IOACPIPlane:/_SB/PCI0@0/GPP9@30001");
     IORegistryEntry *pegE = IORegistryEntry::fromPath("IOACPIPlane:/_SB/PCI0@0/GPP9@30001/PEGP@0");
@@ -629,6 +676,11 @@ static void powerOff()
             // confirms the link is down before terminating (no read at all when nothing is left to terminate)
             if (nf) gVendorAfter = cfg16(gGpuSpace, 0);
             note("eco: RTX already off (GPP9.GSTA 0)");
+        } else if (cfg16(gGpuSpace, 0) == 0xffff) {
+            // GSTA says powered but the display function does not answer config reads: the bridge or link is not restored yet
+            // (e.g. just after a wake). D3hot could not be written, and _PS3 would cut the rail on a card in D0: run nothing,
+            // the 90 s / 5 min re-check (or the next pass) tries again.
+            note("eco: GPP9.GSTA 1 but the RTX does not answer config reads: power-off deferred");
         } else {
             // the card is powered, so config space answers: (re)learn each function's address and PM capability
             for (uint32_t i = 0; i < nf; i++) {

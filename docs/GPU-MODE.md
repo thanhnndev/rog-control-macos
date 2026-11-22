@@ -45,12 +45,20 @@ disabled in the UI.
 
 ## Failure modes
 * IOACPIPlatformDevice evaluate* rejects dotted paths (kIOReturnBadArgument, seen on the first real boot): every call is a single NameSeg on the owning device (GSTA on GPP9; _DSM/_PS3/_PSC on PEGP). Power-off itself is still untested end to end: a hang or panic is possible.  (StrixS0ix 0.1.16 same path, also not installed): a hang or panic is possible. Guard: Eco claim sets
-  `strix-gpu-eco-try=1`, cleared as soon as the boot has finished (RTX off and WindowServer's display client up, polled from
-  10 s; 90 s at the latest) and on every clean shut down / restart; if still 1 at the next boot the gate stands down once
+  `strix-gpu-eco-try=1`, cleared once the boot has finished (RTX off and off the bus, or keepbus / dry run, and WindowServer's
+  display client up, on two 5 s polls in a row and not before 30 s; 90 s at the latest) and on every clean shut down /
+  restart if WindowServer's display was ever seen (a boot shut down over ssh from a desktop that never came up keeps 1); if still 1 at the next boot the gate stands down once
   (RTX to NVRM) and reports `gate-tripped`. Until 0.2.3 a clean shutdown before the 90 s clear tripped the next boot
   (2026-11-20 11:07: shut down at T+35 s, 11-22 came up in Standard): the shutdown clear required the 90 s clear first, and
-  the root-domain notifier was general interest, which never receives WillPowerOff / WillRestart (or the wake message).
-  0.2.4 uses `registerPrioritySleepWakeInterest`. Still trips (by design): forced power-off, panic or power loss before the
+  the root-domain notifier was general interest. Checked in the 25G332 kernel: `handlePlatformHaltRestart` sends
+  WillPowerOff / WillRestart only to `gIOPriorityPowerStateInterest`, while `IOService::tellClients` (sleep/wake messages)
+  goes to priority, app and general interest alike. So shutdown never reached the gate, but HasPoweredOn did. 0.2.4+ uses
+  `registerPrioritySleepWakeInterest`.
+* Wake re-off (power-off pass 3 s after HasPoweredOn) is off by default since 0.2.5: it has never been observed running
+  here, and at +3 s the bridge may not be restored. Turn on with boot-arg `strixgate_wakereoff=1` or `sudo nvram
+  strix-gpu-wake-reoff=1`. Every pass is skipped between WillSleep and HasPoweredOn, and a pass that finds GSTA 1 but the
+  card not answering config reads runs nothing (no `_PS3` on a D0 card). Properties `gate-wake-msgs`, `gate-sleep-msgs`,
+  `gate-last-wake-uptime`, `gate-wake-reoff` show whether the messages arrive. Still trips (by design): forced power-off, panic or power loss before the
   boot finished.
 * Gate kext missing/not loaded: Eco is stored but has no effect; the app warns and shows "StrixDgpuGate not loaded".
 * NVRAM write refused/not persisted (OpenCore emulated NVRAM without LegacySchema): app shows the old mode after re-read.
