@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause-Clear
 // Copyright (c) 2026 thanhnndev and contributors
 //
-// StrixDgpuGate 0.2.8: "Eco" for the RTX 5060 on the GA403WM under macOS Tahoe 26 (Darwin 25.x).
+// StrixDgpuGate 0.2.9: "Eco" for the RTX 5060 on the GA403WM under macOS Tahoe 26 (Darwin 25.x).
 //
 // The NullMoth NVIDIA stack (NVRM and the kexts that sit on it) binds the RTX at boot and has no runtime power management,
 // so the card can only be powered off when NVRM never attached to it. StrixDgpuClaim matches the RTX with a higher probe
@@ -26,6 +26,10 @@
 // 0.2.8: the slow pass is capped at SLOW_MAX_ROUNDS per wake (count reset at HasPoweredOn) and is not armed when GSTA could
 // not be read; it is cancelled at WillSleep and resumed at the wake (or at the self-heal); deferred-retry resets from other
 // threads are requests consumed under gOffLock.
+// 0.2.9: shutdown trace. NVRAM strix-gpu-sd = "<boot>|A<wall s>.<ms>:<awake s>|B<wall s>.<ms>:<awake s>": A at the priority
+// WillPowerOff / WillRestart message, B at systemWillShutdown (the gate's status service joins the PM tree for it). The next
+// boot publishes it as gate-prev-shutdown; with the CPU reset time (kern.boottime - tsc_base / tsc frequency) it splits a
+// slow shut down into userspace (before A), driver shutdown (A -> B) and halt / platform (after B).
 // In every other case probe() returns null and NVRM binds as if this kext did not exist.
 //
 // AsusWmi: with the nubs gone, its rtxForeignDriver() finds no RTX, so ASUS_GPF_LIVE_OK stays clear and ASUS_GPU_SET_DGPU
@@ -75,6 +79,7 @@
 #define VAR_MODE "strix-gpu-mode"
 #define VAR_TRY  "strix-gpu-eco-try"
 #define VAR_BOOTS   "strix-gpu-eco-boots"      // counts Eco claims (one per boot); written in start()
+#define VAR_SD "strix-gpu-sd"               // shutdown trace (0.2.9), see the header
 #define VAR_CLEARED "strix-gpu-eco-cleared"    // "<boot counter>:<awake uptime s>" written just before try is cleared
 
 static void cp(char *d, const char *s, size_t n) { size_t i = 0; for (; i + 1 < n && s[i]; i++) d[i] = s[i]; d[i] = 0; }
@@ -86,6 +91,7 @@ static char gState[96] = "not probed";
 static uint32_t gBootN, gClaimStarts, gClearStage, gClearUp;
 static bool gCleared, gStaleTry;
 static char gTryAtProbe[8], gPrevBoots[16], gPrevCleared[32], gClearedStr[32], gTryReadback[8];
+static char gPrevSd[80], gSdStr[80];      // shutdown trace: last boot's (read at start) / this boot's
 static uint32_t gOffBusTerms, gOffBusPasses, gOffBusRounds, gGstaRecheck = ~0u;
 #define OFFBUS_MAX_ROUNDS 4         // terminate rounds within one window before the nubs are kept
 #define OFFBUS_WINDOW_S 120         // window length; also restarted at every wake (each wake may re-create the nubs once)
@@ -173,8 +179,9 @@ static bool onBattery(bool *known)
 class StrixDgpuGate : public IOService {
     OSDeclareDefaultStructors(StrixDgpuGate)
 public:
-    bool start(IOService *provider) override { if (!IOService::start(provider)) return false; gInfo = this; publish(); registerService(); return true; }
+    bool start(IOService *provider) override;
     void stop(IOService *provider) override;
+    void systemWillShutdown(IOOptionBits specifier) override;
     void publish()
     {
         setProperty("gate-effective", (unsigned long long)gEffective, 32);
@@ -205,6 +212,7 @@ public:
         if (gTryAtProbe[0]) setProperty("gate-try-at-probe", gTryAtProbe);
         if (gPrevBoots[0]) setProperty("gate-prev-boots", gPrevBoots);
         if (gPrevCleared[0]) setProperty("gate-prev-cleared", gPrevCleared);
+        if (gPrevSd[0]) setProperty("gate-prev-shutdown", gPrevSd);
         {
             char cs[sizeof gClearedStr];   // clearNow writes it under gClearLock (and calls publish only after unlocking)
             if (gClearLock) IOLockLock(gClearLock);
@@ -242,6 +250,45 @@ public:
 };
 OSDefineMetaClassAndStructors(StrixDgpuGate, IOService)
 
+// Shutdown trace (0.2.9): append "|<stage><wall s>.<ms>:<awake s>" to this boot's record and write it with a forced sync.
+// Called on the PM thread (priority message, systemWillShutdown); NVRAM is still up at both points.
+static void sdStamp(char stage)
+{
+    clock_sec_t sec = 0; clock_usec_t usec = 0;
+    clock_get_calendar_microtime(&sec, &usec);
+    if (!gSdStr[0]) snprintf(gSdStr, sizeof gSdStr, "%u", (unsigned)gBootN);
+    size_t n = strlen(gSdStr);
+    if (n + 24 >= sizeof gSdStr) return;
+    snprintf(gSdStr + n, sizeof gSdStr - n, "|%c%lu.%03u:%u", stage, (unsigned long)sec, (unsigned)(usec / 1000), (unsigned)uptimeS());
+    writeVar(VAR_SD, gSdStr);
+}
+
+static IOPMPowerState gSdStates[2] = {
+    { kIOPMPowerStateVersion1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    { kIOPMPowerStateVersion1, kIOPMPowerOn, kIOPMPowerOn, kIOPMPowerOn, 0, 0, 0, 0, 0, 0, 0, 0 },
+};
+
+bool StrixDgpuGate::start(IOService *provider)
+{
+    if (!IOService::start(provider)) return false;
+    gInfo = this;
+    readVar(VAR_SD, gPrevSd, sizeof gPrevSd);
+    publish();
+    registerService();
+    // in the PM tree only so that systemWillShutdown is called (shutdown trace B); one state, nothing to power
+    PMinit();
+    getPMRootDomain()->joinPMtree(this);
+    registerPowerDriver(this, gSdStates, 2);
+    return true;
+}
+
+// Called for every PM-tree driver after the priority WillPowerOff / WillRestart clients and before the platform halt.
+void StrixDgpuGate::systemWillShutdown(IOOptionBits specifier)
+{
+    if (specifier == kIOMessageSystemWillPowerOff || specifier == kIOMessageSystemWillRestart) sdStamp('B');
+    IOService::systemWillShutdown(specifier);
+}
+
 // ---- Eco state that outlives the claim ----------------------------------------------------------------------------------
 // After the card is off, the RTX display and audio nubs are terminated ("off the bus", see powerOff). That stops
 // StrixDgpuClaim, so everything that must keep running for the rest of the boot (loop-guard clears, re-off after resume,
@@ -265,6 +312,7 @@ static uint32_t gHbN, gHbSync = 8, gHbLastG = ~0u, gHbVendor = ~0u, gHbPmcsr = ~
 void StrixDgpuGate::stop(IOService *provider)
 {
     gStopping = true;
+    PMstop();
     if (gWake) { gWake->remove(); gWake = nullptr; }
     if (gAcadNote) { gAcadNote->remove(); gAcadNote = nullptr; }
     thread_call_t *calls[6] = { &gOffCall, &gTryCall, &gHbCall, &gPollCall, &gWakeChkCall, &gSlowCall };
@@ -609,6 +657,7 @@ static IOReturn pmMsg(void *, void *, UInt32 type, IOService *, void *, vm_size_
     // A clean shut down or restart requested from a running system whose desktop came up: this Eco boot did not hang, clear
     // the flag at any uptime (0.2.3 and earlier cleared here only after the 90 s clear, so a shutdown at T+35 s tripped the
     // next boot). A boot whose WindowServer never got a display (e.g. shut down over ssh from a hung desktop) keeps try=1.
+    if (type == kIOMessageSystemWillPowerOff || type == kIOMessageSystemWillRestart) sdStamp('A');
     if ((type == kIOMessageSystemWillPowerOff || type == kIOMessageSystemWillRestart) && gHeld) {
         // latch here too: a shutdown within 5 s of WindowServer's first display comes before the next poll would latch it.
         // windowServerSeen() is a registry walk (no NVRAM, no ACPI), safe on the PM thread that delivers this message.
