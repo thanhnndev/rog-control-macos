@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause-Clear
 // Copyright (c) 2026 thanhnndev and contributors
 //
-// StrixDgpuGate 0.2.11: "Eco" for the RTX 5060 on the GA403WM under macOS Tahoe 26 (Darwin 25.x).
+// StrixDgpuGate 0.2.12: "Eco" for the RTX 5060 on the GA403WM under macOS Tahoe 26 (Darwin 25.x).
 //
 // The NullMoth NVIDIA stack (NVRM and the kexts that sit on it) binds the RTX at boot and has no runtime power management,
 // so the card can only be powered off when NVRM never attached to it. StrixDgpuClaim matches the RTX with a higher probe
@@ -41,6 +41,11 @@
 // registered by the status service in every mode, not by the Eco claim). The S stamp makes the record self-identifying:
 // a record with S but no A/B is a boot that did not shut down cleanly; the Eco boot counter cannot do that (it stays 0 in
 // Standard). A missing B is not proof of a hang between A and B: the NVRAM store may have been flushed before B ran.
+// Every stamp is a forced sync (an Eco shutdown: A, B and clearNow's two = four).
+// 0.2.12: the gate (IOResources) starts before AppleEFINVRAM, so /options may be empty in start(). The NVRAM opt-out
+// (exact value "0"), the previous record and S now run on a thread call after IODTNVRAM's first publish; the PM-tree join
+// and the A notifier only after that. The trace is gated on Darwin 25.x like the claim. pmMsg returns at once unless the
+// gate holds the card. Property gate-sd-trace: "waiting for NVRAM", "on", or "off (...)" with the reason.
 // In every other case probe() returns null and NVRM binds as if this kext did not exist.
 //
 // AsusWmi: with the nubs gone, its rtxForeignDriver() finds no RTX, so ASUS_GPF_LIVE_OK stays clear and ASUS_GPU_SET_DGPU
@@ -106,6 +111,9 @@ static bool gCleared, gStaleTry;
 static char gTryAtProbe[8], gPrevBoots[16], gPrevCleared[32], gClearedStr[32], gTryReadback[8];
 static bool gSdOn, gInPmTree;                         // shutdown trace enabled (see 0.2.11 in the header)
 static IONotifier *gSdNote;                 // priority sleep/wake notifier of the shutdown trace (stamp A)
+static IONotifier *gNvNote;                 // first-publish notification of IODTNVRAM: the trace's NVRAM work waits for it
+static thread_call_t gSdInitCall;           // runs that NVRAM work (opt-out read, previous record, S) off the notifier
+static volatile UInt32 gSdInitQueued;
 static char gPrevSd[80], gSdStr[80];      // shutdown trace: last boot's (read at start) / this boot's
 static uint32_t gOffBusTerms, gOffBusPasses, gOffBusRounds, gGstaRecheck = ~0u;
 #define OFFBUS_MAX_ROUNDS 4         // terminate rounds within one window before the nubs are kept
@@ -197,6 +205,8 @@ public:
     bool start(IOService *provider) override;
     void stop(IOService *provider) override;
     void systemWillShutdown(IOOptionBits specifier) override;
+    static bool nvPublished(void *, void *, IOService *, IONotifier *);
+    static void sdInit(thread_call_param_t, thread_call_param_t);
     void publish()
     {
         setProperty("gate-effective", (unsigned long long)gEffective, 32);
@@ -265,8 +275,9 @@ public:
 };
 OSDefineMetaClassAndStructors(StrixDgpuGate, IOService)
 
-// Shutdown trace (0.2.9): append "|<stage><wall s>.<ms>:<awake s>" to this boot's record and write it with a forced sync.
-// Called on the PM thread (priority message, systemWillShutdown); NVRAM is still up at both points.
+// Shutdown trace: append a stamp to this boot's record and write it with a forced NVRAM sync, every stamp (S at the gate's
+// NVRAM init on a thread call, A on the PM thread at the priority message, B at systemWillShutdown; NVRAM is still up at
+// both shutdown points). An Eco shutdown therefore forces four syncs: A, B and the two of clearNow.
 static void sdStamp(char stage)
 {
     if (!gSdOn) return;
@@ -297,27 +308,52 @@ bool StrixDgpuGate::start(IOService *provider)
 {
     if (!IOService::start(provider)) return false;
     gInfo = this;
-    char sv[8] = {0};
     uint32_t bv = 1;
-    gSdOn = !PE_parse_boot_argn("-strixgate_off", nullptr, 0)
-         && !(PE_parse_boot_argn("strixgate_sdtrace", &bv, sizeof bv) && bv == 0)
-         && !(readVar("strix-gpu-sdtrace", sv, sizeof sv) && sv[0] == '0');
-    if (gSdOn) readVar(VAR_SD, gPrevSd, sizeof gPrevSd);
-    setProperty("gate-sd-trace", gSdOn);
+    // boot-args are up at start; NVRAM is not (this IOResources match starts before AppleEFINVRAM), so the NVRAM opt-out,
+    // the previous record and S wait for IODTNVRAM's first publish (sdInit)
+    bool want = version_major == 25
+             && !PE_parse_boot_argn("-strixgate_off", nullptr, 0)
+             && !(PE_parse_boot_argn("strixgate_sdtrace", &bv, sizeof bv) && bv == 0);
+    setProperty("gate-sd-trace", want ? "waiting for NVRAM" : "off");
     publish();
     registerService();
-    if (!gSdOn) return true;                            // 0.2.6 behaviour: properties only
+    if (!want) return true;                             // 0.2.6 behaviour: properties only
+    if (!(gSdInitCall = thread_call_allocate(sdInit, nullptr))) return true;
+    if (OSDictionary *m = IOService::serviceMatching("IODTNVRAM")) {
+        gNvNote = IOService::addMatchingNotification(gIOFirstPublishNotification, m, &nvPublished, nullptr);
+        m->release();
+    }
+    return true;
+}
+
+bool StrixDgpuGate::nvPublished(void *, void *, IOService *, IONotifier *)
+{
+    if (gSdInitCall && !gStopping && OSCompareAndSwap(0, 1, &gSdInitQueued)) thread_call_enter(gSdInitCall);
+    return true;
+}
+
+void StrixDgpuGate::sdInit(thread_call_param_t, thread_call_param_t)
+{
+    StrixDgpuGate *me = gInfo;
+    if (gStopping || !me) return;
+    char sv[8];
+    if (readVar("strix-gpu-sdtrace", sv, sizeof sv) && !strcmp(sv, "0")) { me->setProperty("gate-sd-trace", "off (NVRAM strix-gpu-sdtrace=0)"); return; }
+    IORegistryEntry *o = opts();
+    if (!o) { me->setProperty("gate-sd-trace", "off (no /options)"); return; }
+    o->release();
+    readVar(VAR_SD, gPrevSd, sizeof gPrevSd);
     // in the PM tree only so that systemWillShutdown is called (shutdown trace B); one state, nothing to power
-    IOPMrootDomain *root = getPMRootDomain();
-    if (root) {
-        PMinit();
-        root->joinPMtree(this);
-        registerPowerDriver(this, gSdStates, 2);
+    if (IOPMrootDomain *root = me->getPMRootDomain()) {
+        me->PMinit();
+        root->joinPMtree(me);
+        me->registerPowerDriver(me, gSdStates, 2);
         gInPmTree = true;
     }
     gSdNote = registerPrioritySleepWakeInterest(&sdMsg, nullptr);
+    gSdOn = true;
     sdStamp('S');                                       // this boot's record starts here; the next boot reads it
-    return true;
+    me->setProperty("gate-sd-trace", "on");
+    me->publish();
 }
 
 // Called for every PM-tree driver after the priority WillPowerOff / WillRestart clients and before the platform halt.
@@ -350,8 +386,11 @@ static uint32_t gHbN, gHbSync = 8, gHbLastG = ~0u, gHbVendor = ~0u, gHbPmcsr = ~
 void StrixDgpuGate::stop(IOService *provider)
 {
     gStopping = true;
+    if (gNvNote) { gNvNote->remove(); gNvNote = nullptr; }
+    if (gSdInitCall) { thread_call_cancel_wait(gSdInitCall); thread_call_free(gSdInitCall); gSdInitCall = nullptr; }
     if (gSdNote) { gSdNote->remove(); gSdNote = nullptr; }
     if (gInPmTree) { PMstop(); gInPmTree = false; }
+    gSdOn = false; gSdInitQueued = 0; gSdStr[0] = 0; gPrevSd[0] = 0;
     if (gWake) { gWake->remove(); gWake = nullptr; }
     if (gAcadNote) { gAcadNote->remove(); gAcadNote = nullptr; }
     thread_call_t *calls[6] = { &gOffCall, &gTryCall, &gHbCall, &gPollCall, &gWakeChkCall, &gSlowCall };
@@ -695,6 +734,7 @@ static void clearTry(thread_call_param_t, thread_call_param_t)
 
 static IOReturn pmMsg(void *, void *, UInt32 type, IOService *, void *, vm_size_t)
 {
+    if (!gHeld) return kIOReturnSuccess;               // Eco state only; do not rely on when the claim registered this
     // A clean shut down or restart requested from a running system whose desktop came up: this Eco boot did not hang, clear
     // the flag at any uptime (0.2.3 and earlier cleared here only after the 90 s clear, so a shutdown at T+35 s tripped the
     // next boot). A boot whose WindowServer never got a display (e.g. shut down over ssh from a hung desktop) keeps try=1.
