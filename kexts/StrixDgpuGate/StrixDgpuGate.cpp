@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause-Clear
 // Copyright (c) 2026 thanhnndev and contributors
 //
-// StrixDgpuGate 0.2.9: "Eco" for the RTX 5060 on the GA403WM under macOS Tahoe 26 (Darwin 25.x).
+// StrixDgpuGate 0.2.10: "Eco" for the RTX 5060 on the GA403WM under macOS Tahoe 26 (Darwin 25.x).
 //
 // The NullMoth NVIDIA stack (NVRM and the kexts that sit on it) binds the RTX at boot and has no runtime power management,
 // so the card can only be powered off when NVRM never attached to it. StrixDgpuClaim matches the RTX with a higher probe
@@ -30,6 +30,11 @@
 // WillPowerOff / WillRestart message, B at systemWillShutdown (the gate's status service joins the PM tree for it). The next
 // boot publishes it as gate-prev-shutdown; with the CPU reset time (kern.boottime - tsc_base / tsc frequency) it splits a
 // slow shut down into userspace (before A), driver shutdown (A -> B) and halt / platform (after B).
+// 0.2.10: shutdown stops every pass (gShuttingDown at WillPowerOff / WillRestart: queued passes cancelled, a running one
+// waited out, power-off / slow / re-check passes and heartbeat ACPI reads bail). The slow pass is no longer cancelled at
+// WillSleep (it re-arms itself without ACPI in the sleep window), and WillSleep arms the wake re-check 200 s out as a heal
+// timer, so a missed wake message cannot leave gSleeping and a latched pass set with the card on. GSTA unreadable (~0u) runs
+// nothing; the deferred branch needs GSTA 1; gSlowRounds is atomic.
 // In every other case probe() returns null and NVRM binds as if this kext did not exist.
 //
 // AsusWmi: with the nubs gone, its rtxForeignDriver() finds no RTX, so ASUS_GPF_LIVE_OK stays clear and ASUS_GPU_SET_DGPU
@@ -105,8 +110,8 @@ static uint32_t gSleepAtUp;          // awake uptime at the last WillSleep: gSle
 static volatile UInt32 gOffPending; // 1: a pass was cancelled or skipped because of sleep: run it at the wake (CAS to take)
 static uint32_t gDeferRetries, gDeferTotal, gSleepHeals, gPendingRuns;   // gDeferRetries: only under gOffLock
 static volatile UInt32 gDeferResetReq;  // 1: give the next pass a fresh deferred-retry budget (set anywhere, taken under gOffLock)
-static volatile UInt32 gSlowPending;    // 1: WillSleep cancelled an armed slow pass: re-arm it at the wake
-static uint32_t gSlowRounds, gSlowTotal;  // slow passes since the last wake / this boot
+static volatile SInt32 gSlowRounds, gSlowTotal;  // slow passes since the last wake / this boot (atomic: slow call + PM thread)
+static volatile bool gShuttingDown;     // set at WillPowerOff / WillRestart: no power-off, slow or re-check pass after it
 #define SLOW_MAX_ROUNDS 6                 // 30 min of slow passes per wake, then wait for the next wake or re-check
 static volatile bool gRoundsResetPending;   // set by the wake message, consumed under gOffLock
 static uint32_t gWakeMsgs, gSleepMsgs, gLastWakeUp, gGoodPolls;
@@ -426,7 +431,7 @@ OSDefineMetaClassAndStructors(StrixDgpuAccelHold, IOService)
 
 static void scheduleOff(uint32_t ms, const char *why)
 {
-    if (gStopping || !gHeld || gDry || !gOffCall) return;
+    if (gStopping || gShuttingDown || !gHeld || gDry || !gOffCall) return;
     IOLog("StrixDgpuGate: power-off pass in %u ms (%s)\n", (unsigned)ms, why);
     uint64_t dl;
     clock_interval_to_deadline(ms, kMillisecondScale, &dl);
@@ -578,32 +583,30 @@ static void latchPending(const char *what)
 
 // Slow pass: every 5 min while a pass left the card on (deferred retries used up, or _PS3 did not bring GSTA to 0).
 // At most SLOW_MAX_ROUNDS per wake (reset at HasPoweredOn), so a card whose _PS3 never takes does not get _DSM + D3hot +
-// _PS3 every 5 min for a whole day of idle uptime. Cancelled at WillSleep (latched in gSlowPending, re-armed at the wake).
+// _PS3 every 5 min for a whole day of idle uptime. Not cancelled at WillSleep: a slow pass that fires in the sleep window
+// only re-arms itself (sleepingNow, no ACPI), and keeps calling sleepingNow so its self-heal runs if no wake message comes.
 static void scheduleSlow()
 {
-    if (!gSlowCall || gStopping) return;
+    if (!gSlowCall || gStopping || gShuttingDown) return;
     uint64_t dl;
     clock_interval_to_deadline(300, kSecondScale, &dl);
     thread_call_enter_delayed(gSlowCall, dl);
 }
-static void resumeSlow(const char *when)
-{
-    if (OSCompareAndSwap(1, 0, &gSlowPending) && !gOff && gHeld && !gDry) { IOLog("StrixDgpuGate: slow pass re-armed (%s)\n", when); scheduleSlow(); }
-}
 static void slowCheck(thread_call_param_t, thread_call_param_t)
 {
-    if (gStopping || !gHeld || gDry || gOff) return;
+    if (gStopping || gShuttingDown || !gHeld || gDry || gOff) return;
     if (sleepingNow()) { scheduleSlow(); return; }       // fired in the sleep window: try again later, no round used
-    gSlowRounds++; gSlowTotal++;
+    SInt32 round = OSIncrementAtomic(&gSlowRounds) + 1;
+    OSIncrementAtomic(&gSlowTotal);
     gDeferResetReq = 1;
     char why[64];
-    snprintf(why, sizeof why, "slow re-check %u/%u: card still on", (unsigned)gSlowRounds, (unsigned)SLOW_MAX_ROUNDS);
+    snprintf(why, sizeof why, "slow re-check %u/%u: card still on", (unsigned)round, (unsigned)SLOW_MAX_ROUNDS);
     scheduleOff(1000, why);
 }
 
 static void recheck(const char *when)
 {
-    if (!gHeld || gDry || gStopping) return;
+    if (!gHeld || gDry || gStopping || gShuttingDown) return;
     if (sleepingNow()) { latchPending(when); return; }
     gGstaRecheck = evalInt(gpp9(), "GSTA");
     uint32_t nubs = gKeepBus ? 0 : rtxNubsOnBus();
@@ -657,7 +660,16 @@ static IOReturn pmMsg(void *, void *, UInt32 type, IOService *, void *, vm_size_
     // A clean shut down or restart requested from a running system whose desktop came up: this Eco boot did not hang, clear
     // the flag at any uptime (0.2.3 and earlier cleared here only after the 90 s clear, so a shutdown at T+35 s tripped the
     // next boot). A boot whose WindowServer never got a display (e.g. shut down over ssh from a hung desktop) keeps try=1.
-    if (type == kIOMessageSystemWillPowerOff || type == kIOMessageSystemWillRestart) sdStamp('A');
+    if (type == kIOMessageSystemWillPowerOff || type == kIOMessageSystemWillRestart) {
+        // no ACPI on the card once shutdown has started: stop every pass source, then wait out a running pass (one pass at
+        // most: _DSM + D3hot + _PS3, tens of ms). Passes that are already queued bail on the flag.
+        gShuttingDown = true;
+        if (gOffCall) thread_call_cancel(gOffCall);
+        if (gSlowCall) thread_call_cancel(gSlowCall);
+        if (gWakeChkCall) thread_call_cancel(gWakeChkCall);
+        if (gOffLock) { IOLockLock(gOffLock); IOLockUnlock(gOffLock); }
+        sdStamp('A');
+    }
     if ((type == kIOMessageSystemWillPowerOff || type == kIOMessageSystemWillRestart) && gHeld) {
         // latch here too: a shutdown within 5 s of WindowServer's first display comes before the next poll would latch it.
         // windowServerSeen() is a registry walk (no NVRAM, no ACPI), safe on the PM thread that delivers this message.
@@ -669,22 +681,24 @@ static IOReturn pmMsg(void *, void *, UInt32 type, IOService *, void *, vm_size_
         // no power-off pass during the sleep transition: cancel a pending one and wait out a running one
         gSleepAtUp = uptimeS(); gSleeping = true; gSleepMsgs++;
         if (gOffCall && thread_call_cancel(gOffCall)) { gOffPending = 1; IOLog("StrixDgpuGate: pending power-off pass cancelled by sleep: runs at the wake\n"); }
-        if (gWakeChkCall) thread_call_cancel(gWakeChkCall);   // the next HasPoweredOn schedules it again
-        if (gSlowCall && thread_call_cancel(gSlowCall)) gSlowPending = 1;   // no slow pass across the sleep; re-armed at the wake
+        // the wake re-check doubles as the heal timer: 200 s of awake uptime after WillSleep it runs recheck(), whose
+        // sleepingNow() self-heals a missed wake message (clears gSleeping, runs a latched pass) and reads GSTA. A wake or
+        // WillNotSleep cancels it again. The slow pass stays armed (it re-arms itself without ACPI in the sleep window).
+        if (gWakeChkCall && !gStopping) { thread_call_cancel(gWakeChkCall); uint64_t dl; clock_interval_to_deadline(200, kSecondScale, &dl); thread_call_enter_delayed(gWakeChkCall, dl); }
         if (gOffLock) { IOLockLock(gOffLock); IOLockUnlock(gOffLock); }
     }
     if (type == kIOMessageSystemWillNotSleep) {
         gSleeping = false;
+        if (gWakeChkCall) thread_call_cancel(gWakeChkCall);   // the heal timer armed at WillSleep
         if (takePending()) { gPendingRuns++; scheduleOff(1000, "pass dropped by a sleep that did not happen"); }
-        resumeSlow("sleep did not happen");
     }
     if (type == kIOMessageSystemHasPoweredOn) {
         gSleeping = false; gWakeMsgs++; gLastWakeUp = uptimeS();
         IOLog("StrixDgpuGate: HasPoweredOn #%u at awake uptime %u s, wake re-off %s\n", (unsigned)gWakeMsgs, (unsigned)gLastWakeUp, gWakeReoff ? "on" : "off");
         gRoundsResetPending = true;                       // new terminate-round window per wake
         gDeferResetReq = 1;
-        gSlowRounds = 0;                                  // a new wake gets SLOW_MAX_ROUNDS slow passes again
-        resumeSlow("wake");
+        OSBitAndAtomic(0, (volatile UInt32 *)&gSlowRounds);   // a new wake gets SLOW_MAX_ROUNDS slow passes again
+        if (gWakeChkCall) thread_call_cancel(gWakeChkCall);   // the heal timer armed at WillSleep (re-armed at +3 s below if needed)
         // one action per wake: a pending pass or the unconditional wake re-off pass (a full pass reads GSTA and the nubs
         // itself), otherwise the read-only re-check 3 s after the wake, which starts a pass only when the card came back
         if (takePending()) { gPendingRuns++; scheduleOff(3000, "pass dropped by sleep"); }
@@ -802,15 +816,16 @@ static bool sleepingNow()
     if (up - gSleepAtUp < 180) return true;
     gSleeping = false; gSleepHeals++;
     IOLog("StrixDgpuGate: sleep flag set at awake uptime %u s still set at %u s with no wake message: cleared\n", (unsigned)gSleepAtUp, (unsigned)up);
-    resumeSlow("sleep flag self-heal");
+    if (takePending()) { gPendingRuns++; scheduleOff(1000, "pass dropped by sleep (no wake message, self-heal)"); }
     return false;
 }
 
 static void powerOff()
 {
-    if (!gOffLock || gStopping) return;
+    if (!gOffLock || gStopping || gShuttingDown) return;
     if (sleepingNow()) { latchPending("power-off pass"); return; }
     IOLockLock(gOffLock);
+    if (gShuttingDown) { IOLockUnlock(gOffLock); IOLog("StrixDgpuGate: power-off pass skipped: shutting down\n"); return; }
     if (sleepingNow()) { IOLockUnlock(gOffLock); latchPending("power-off pass"); return; }
     bool retry = false, deferred = false;
     if (OSCompareAndSwap(1, 0, &gDeferResetReq)) gDeferRetries = 0;
@@ -835,7 +850,13 @@ static void powerOff()
             if (nf) gVendorAfter = cfg16(gGpuSpace, 0);
             note("eco: RTX already off (GPP9.GSTA 0)");
             gDeferRetries = 0;
-        } else if (nf && cfg16(gGpuSpace, 0) == 0xffff) {
+        } else if (gGstaBefore == ~0u) {
+            // GSTA evaluation failed: the power state is unknown, not "on". No _DSM, D3hot or _PS3 on an unknown state, no
+            // retry and no slow pass (gSta ~0u); the next wake or re-check reads it again.
+            gOff = false; gSta = ~0u; gGstaAfter = ~0u; gVendorAfter = ~0u;
+            note("eco: GPP9.GSTA unreadable: nothing run");
+            gDeferRetries = 0;
+        } else if (gGstaBefore == 1 && nf && cfg16(gGpuSpace, 0) == 0xffff) {
             // GSTA says powered, RTX nubs are on the bus, and the display function does not answer config reads: the bridge or
             // link is not restored yet (e.g. just after a wake). D3hot could not be written, and _PS3 would cut the rail on a
             // card that may be in D0 with live nubs: run nothing now, try again 5 s later, 3 times per trigger.
@@ -901,7 +922,7 @@ static void powerOff()
         // evaluation failed: unknown, not "on") and the per-wake cap is not used up
         if (!why && !gOff && !gDry) {
             if (gSta == ~0u) IOLog("StrixDgpuGate: eco: GPP9.GSTA unreadable after the pass: no slow pass armed\n");
-            else if (gSlowRounds >= SLOW_MAX_ROUNDS) IOLog("StrixDgpuGate: eco: %u slow passes since the wake and the card is still on: stopped until the next wake or re-check\n", (unsigned)gSlowRounds);
+            else if (gSlowRounds >= SLOW_MAX_ROUNDS) IOLog("StrixDgpuGate: eco: %u slow passes since the wake and the card is still on: no more slow passes until the next wake (a re-check does not reset the count)\n", (unsigned)gSlowRounds);
             else scheduleSlow();
         }
     }
@@ -970,11 +991,13 @@ static void hbSample()
     if (gHbPrev) { uint64_t d; absolutetime_to_nanoseconds(now - gHbPrev, &d); uint32_t gap = (uint32_t)(d / 1000000ULL); if (gap > gHbMaxGapMs) gHbMaxGapMs = gap; }
     gHbPrev = now;
 
-    uint32_t g = evalInt(gHbGpp, "GSTA");
+    // no ACPI and no config reads in the sleep window or after shutdown started: the sample records g -1 and keeps the rest
+    bool quiet = gShuttingDown || sleepingNow();
+    uint32_t g = quiet ? ~0u : evalInt(gHbGpp, "GSTA");
     if (n && gHbLastG != ~0u && g != ~0u && g != gHbLastG) { gHbFlips++; if (g == 1 && gHbFirstFlipMs == ~0u) gHbFirstFlipMs = ms; }
     gHbLastG = g;
     bool deadKnown = g == 0 && gHbVendor == 0xffff;                       // never read config of a link known to be down
-    if (n % 4 == 0) {
+    if (n % 4 == 0 && !quiet) {
         if (!deadKnown && gBridge) {
             gHbVendor = cfg16(gGpuSpace, 0);
             gHbPmcsr = (gHbVendor != 0xffff && gGpuPm) ? cfg16(gGpuSpace, gGpuPm + 4) : ~0u;

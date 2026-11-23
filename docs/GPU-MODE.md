@@ -61,12 +61,15 @@ disabled in the UI.
   general-interest notifier also got it and ran a pass at every full wake. The switch `strixgate_wakereoff=1` /
   `sudo nvram strix-gpu-wake-reoff=1` (default off since 0.2.5) only adds that unconditional pass. No pass runs between
   WillSleep and HasPoweredOn / WillNotSleep; a pass cancelled or skipped then is run at the wake (`gate-pending-runs`). The
-  sleep flag clears itself 180 s of awake uptime after WillSleep if no wake message came (`gate-sleep-heals`).
+  sleep flag clears itself 180 s of awake uptime after WillSleep if no wake message came (`gate-sleep-heals`); since 0.2.10
+  WillSleep arms the wake re-check 200 s out as the timer that runs that self-heal (and a latched pass), and a wake cancels it.
+  From WillPowerOff / WillRestart on (0.2.10) no pass runs at all: queued ones are cancelled, a running one is waited out.
   A pass that finds GSTA 1 but the card not answering config reads: with RTX nubs on the bus it runs nothing (no `_PS3` on a
   card that may be in D0 with live nubs), marks the card on (`gate-powered-off` false) and retries 3 times 5 s apart per
   trigger (`gate-defer-retries` counts deferrals); after that (or when `_PS3` left GSTA at 1) a slow pass runs every 5 min
   until the card is off (0.2.7), at most 6 per wake (0.2.8; the count restarts at HasPoweredOn), never when GSTA could not
-  be read, and not across a sleep (cancelled at WillSleep, re-armed at the wake). `gate-slow-passes` counts them. With no
+  be read (0.2.10: an unreadable GSTA runs nothing at all), and with no ACPI inside the sleep window (0.2.10: the slow pass
+  stays armed at WillSleep and only re-arms itself while the sleep flag is set). `gate-slow-passes` counts them. With no
   nubs (idled GPP9 bridge, PG00 re-powered by the platform) it runs `_DSM` + `_PS3` as 0.2.3 did. Properties `gate-wake-msgs`, `gate-sleep-msgs`,
   `gate-last-wake-uptime`, `gate-wake-reoff` show whether the messages arrive. Still trips (by design): forced power-off, panic or power loss before the
   boot finished.
