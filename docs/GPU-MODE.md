@@ -65,7 +65,8 @@ disabled in the UI.
   A pass that finds GSTA 1 but the card not answering config reads: with RTX nubs on the bus it runs nothing (no `_PS3` on a
   card that may be in D0 with live nubs), marks the card on (`gate-powered-off` false) and retries 3 times 5 s apart per
   trigger (`gate-defer-retries` counts deferrals); after that (or when `_PS3` left GSTA at 1) a slow pass runs every 5 min
-  until the card is off (0.2.7). With no
+  until the card is off (0.2.7), at most 6 per wake (0.2.8; the count restarts at HasPoweredOn), never when GSTA could not
+  be read, and not across a sleep (cancelled at WillSleep, re-armed at the wake). `gate-slow-passes` counts them. With no
   nubs (idled GPP9 bridge, PG00 re-powered by the platform) it runs `_DSM` + `_PS3` as 0.2.3 did. Properties `gate-wake-msgs`, `gate-sleep-msgs`,
   `gate-last-wake-uptime`, `gate-wake-reoff` show whether the messages arrive. Still trips (by design): forced power-off, panic or power loss before the
   boot finished.
