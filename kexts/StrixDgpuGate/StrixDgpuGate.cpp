@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause-Clear
 // Copyright (c) 2026 thanhnndev and contributors
 //
-// StrixDgpuGate 0.2.12: "Eco" for the RTX 5060 on the GA403WM under macOS Tahoe 26 (Darwin 25.x).
+// StrixDgpuGate 0.2.13: "Eco" for the RTX 5060 on the GA403WM under macOS Tahoe 26 (Darwin 25.x).
 //
 // The NullMoth NVIDIA stack (NVRM and the kexts that sit on it) binds the RTX at boot and has no runtime power management,
 // so the card can only be powered off when NVRM never attached to it. StrixDgpuClaim matches the RTX with a higher probe
@@ -46,6 +46,8 @@
 // (exact value "0"), the previous record and S now run on a thread call after IODTNVRAM's first publish; the PM-tree join
 // and the A notifier only after that. The trace is gated on Darwin 25.x like the claim. pmMsg returns at once unless the
 // gate holds the card. Property gate-sd-trace: "waiting for NVRAM", "on", or "off (...)" with the reason.
+// 0.2.13: S waits for the calendar clock (0.2.12 stamped "S0:0": NVRAM publishes before the clock is set), retried every
+// second for up to 120 s. A shutdown before S leaves a record that starts with "|A".
 // In every other case probe() returns null and NVRM binds as if this kext did not exist.
 //
 // AsusWmi: with the nubs gone, its rtxForeignDriver() finds no RTX, so ASUS_GPF_LIVE_OK stays clear and ASUS_GPU_SET_DGPU
@@ -114,6 +116,7 @@ static IONotifier *gSdNote;                 // priority sleep/wake notifier of t
 static IONotifier *gNvNote;                 // first-publish notification of IODTNVRAM: the trace's NVRAM work waits for it
 static thread_call_t gSdInitCall;           // runs that NVRAM work (opt-out read, previous record, S) off the notifier
 static volatile UInt32 gSdInitQueued;
+static uint32_t gSdPhase, gSdTries;          // sdInit: 0 = first run, 1 = waiting for the calendar clock before S
 static char gPrevSd[80], gSdStr[80];      // shutdown trace: last boot's (read at start) / this boot's
 static uint32_t gOffBusTerms, gOffBusPasses, gOffBusRounds, gGstaRecheck = ~0u;
 #define OFFBUS_MAX_ROUNDS 4         // terminate rounds within one window before the nubs are kept
@@ -207,6 +210,7 @@ public:
     void systemWillShutdown(IOOptionBits specifier) override;
     static bool nvPublished(void *, void *, IOService *, IONotifier *);
     static void sdInit(thread_call_param_t, thread_call_param_t);
+    static void sdStartStamp(StrixDgpuGate *me);
     void publish()
     {
         setProperty("gate-effective", (unsigned long long)gEffective, 32);
@@ -336,6 +340,7 @@ void StrixDgpuGate::sdInit(thread_call_param_t, thread_call_param_t)
 {
     StrixDgpuGate *me = gInfo;
     if (gStopping || !me) return;
+    if (gSdPhase == 1) { sdStartStamp(me); return; }
     char sv[8];
     if (readVar("strix-gpu-sdtrace", sv, sizeof sv) && !strcmp(sv, "0")) { me->setProperty("gate-sd-trace", "off (NVRAM strix-gpu-sdtrace=0)"); return; }
     IORegistryEntry *o = opts();
@@ -351,9 +356,26 @@ void StrixDgpuGate::sdInit(thread_call_param_t, thread_call_param_t)
     }
     gSdNote = registerPrioritySleepWakeInterest(&sdMsg, nullptr);
     gSdOn = true;
-    sdStamp('S');                                       // this boot's record starts here; the next boot reads it
     me->setProperty("gate-sd-trace", "on");
     me->publish();
+    gSdPhase = 1;
+    sdStartStamp(me);
+}
+
+// S needs a calendar time: IODTNVRAM publishes within the first second of the kernel, before the clock is set from the
+// RTC (0.2.12 wrote "S0:0"). Retry every second, at most 120 times, then stamp whatever the clock says.
+void StrixDgpuGate::sdStartStamp(StrixDgpuGate *)
+{
+    clock_sec_t sec = 0; clock_usec_t usec = 0;
+    clock_get_calendar_microtime(&sec, &usec);
+    if (sec < 1600000000 && gSdTries++ < 120 && gSdInitCall && !gStopping) {
+        uint64_t dl;
+        clock_interval_to_deadline(1, kSecondScale, &dl);
+        thread_call_enter_delayed(gSdInitCall, dl);
+        return;
+    }
+    gSdPhase = 2;
+    sdStamp('S');                                       // this boot's record starts here; the next boot reads it
 }
 
 // Called for every PM-tree driver after the priority WillPowerOff / WillRestart clients and before the platform halt.
@@ -390,7 +412,7 @@ void StrixDgpuGate::stop(IOService *provider)
     if (gSdInitCall) { thread_call_cancel_wait(gSdInitCall); thread_call_free(gSdInitCall); gSdInitCall = nullptr; }
     if (gSdNote) { gSdNote->remove(); gSdNote = nullptr; }
     if (gInPmTree) { PMstop(); gInPmTree = false; }
-    gSdOn = false; gSdInitQueued = 0; gSdStr[0] = 0; gPrevSd[0] = 0;
+    gSdOn = false; gSdInitQueued = 0; gSdPhase = 0; gSdTries = 0; gSdStr[0] = 0; gPrevSd[0] = 0;
     if (gWake) { gWake->remove(); gWake = nullptr; }
     if (gAcadNote) { gAcadNote->remove(); gAcadNote = nullptr; }
     thread_call_t *calls[6] = { &gOffCall, &gTryCall, &gHbCall, &gPollCall, &gWakeChkCall, &gSlowCall };
