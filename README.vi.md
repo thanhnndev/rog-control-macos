@@ -3,7 +3,10 @@
 <p align="center"><img src="docs/images/app-icon.png" alt="ROG Control app icon" width="128"></p>
 
 ROG Control Center cho macOS trên **ASUS ROG Zephyrus G14 (GA403WM)**: chế độ hiệu năng, giới hạn công suất CPU, đường cong
-và tốc độ quạt, giới hạn sạc pin, đèn bàn phím và đèn Slash, từ một app trên thanh menu, chạy trên hai kext.
+và tốc độ quạt, giới hạn sạc pin, chế độ GPU (Eco tắt RTX 5060), đèn bàn phím và đèn Slash, từ một app trên thanh menu, chạy trên ba kext
+(`AsusWmi`, `AmdCppc`, `StrixDgpuGate`).
+
+> Bản tiếng Anh ([README.md](README.md)) là bản đầy đủ cho 0.6.0: bảng Highlights (tính năng nào đã kiểm chứng, ngày nào), chế độ GPU và phần Credits.
 
 macOS không có driver cho thiết bị ACPI WMI của ASUS, nên bộ điều khiển nhúng (EC) giữ nguyên profile và giới hạn công suất
 lúc khởi động và macOS không đổi được chúng. Repo này là phần tương đương trên macOS của `asus-wmi` / `asus-armoury` của Linux
@@ -28,10 +31,13 @@ mã asusctl nào ở đây; xem [NOTICE.md](NOTICE.md).
 
 ## Trạng thái
 
-Máy chuẩn: GA403WM, Ryzen AI 9 HX 370. Chủ máy đã xác nhận ngày 2026-10-12, lúc máy chạy macOS 15 (24H32): profile (Silent /
-Balanced / Turbo), giới hạn công suất Manual, đường cong quạt, tốc độ quạt, giới hạn sạc (60 / 80 / 100 %), cài đặt theo
-nguồn, đèn bàn phím, đèn Slash, app RogControl. macOS 26 (Tahoe) **chưa** được kiểm tra. Các model ASUS khác chưa thử; dải
-giới hạn công suất là của GA403WM. Chi tiết từng tính năng và việc còn mở: [docs/ASUSCTL-MACOS.md](docs/ASUSCTL-MACOS.md).
+Máy chuẩn: GA403WM, Ryzen AI 9 HX 370, RTX 5060, macOS 26.7.2 (2026-11-25). Đang chạy hằng ngày: AsusWmi 0.3.1,
+StrixDgpuGate 0.2.12, AmdCppc 0.2.1, RogControl 0.6.0, rogkeyd 1.2. Chủ máy đã xác nhận từng tính năng ngày 2026-10-12 trên
+macOS 15 (profile, giới hạn công suất, đường cong quạt, tốc độ quạt, giới hạn sạc, đèn bàn phím, đèn Slash). Trên macOS 26:
+chế độ Eco (tắt RTX và gỡ khỏi bus PCI) đã kiểm chứng từ 2026-11-09 / 2026-11-19; **chưa** thử sleep / wake ở chế độ Eco;
+chưa đọc lại đường cong quạt sau bản sửa AsusWmi 0.3.1. Phần âm thanh trong app cần các thành phần âm thanh của dự án
+[GA403WM Hackintosh](https://github.com/thanhnndev/ga403wm-hackintosh), không nằm trong repo này. Các model ASUS khác chưa thử.
+Chi tiết: [docs/ASUSCTL-MACOS.md](docs/ASUSCTL-MACOS.md), [docs/GPU-MODE.md](docs/GPU-MODE.md).
 
 ## Ảnh chụp
 

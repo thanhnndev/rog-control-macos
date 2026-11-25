@@ -1,6 +1,8 @@
 # GPU mode (Eco / Standard / Optimized) on the GA403WM, macOS 26
 
-Status: StrixDgpuGate 8b33c13 verified live (boot 2026-11-09 13:06: dsm0 0, dsm1A 0, ps3 0, GSTA 1->0, PSC 3, vendor 0xFFFF, no panic, 890M fine). AsusWmi 0.3.0 (ABI 6) and RogControl 0.6.0 are built, not installed.
+Status: StrixDgpuGate 8b33c13 verified live (boot 2026-11-09 13:06: dsm0 0, dsm1A 0, ps3 0, GSTA 1->0, PSC 3, vendor 0xFFFF, no panic, 890M fine). AsusWmi 0.3.0 (ABI 6) and RogControl 0.6.0 were installed on 2026-11-10.
+
+State on 2026-11-25 (release `rogcontrol-v0.6.0`): StrixDgpuGate 0.2.12, AsusWmi 0.3.1 and RogControl 0.6.0 run daily in Eco. Sleep / wake and plugging the charger in with the RTX off the bus are not tested.
 
 ## Mechanism
 The NullMoth NVIDIA stack (NVRM 2.7.1, NVRMFB, NVAccel, NVRMAGDC) binds the RTX at boot and has no runtime power
