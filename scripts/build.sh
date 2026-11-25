@@ -54,4 +54,5 @@ TARGETS=("$@")
 
 want AsusWmi "${TARGETS[@]+"${TARGETS[@]}"}" && build_kext AsusWmi kexts/AsusWmi kmod_info.c AsusWmi.cpp
 want AmdCppc "${TARGETS[@]+"${TARGETS[@]}"}" && build_kext AmdCppc kexts/AmdCppc kmod_info.c AmdCppc.cpp
+want StrixDgpuGate "${TARGETS[@]+"${TARGETS[@]}"}" && build_kext StrixDgpuGate kexts/StrixDgpuGate kmod_info.c StrixDgpuGate.cpp
 exit 0

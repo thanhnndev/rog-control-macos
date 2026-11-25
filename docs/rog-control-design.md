@@ -20,7 +20,7 @@ Colour rules (WCAG AA, ratios from the relative-luminance formula on the values 
 
 ## Primary panel
 
-Only what is used daily: CPU temperature (the one large number) with package power and fan speeds, the four modes as a 2x2 grid (Silent, Performance, Turbo, Custom), the charge limit and the keyboard light. Turbo is disabled on battery with "Needs charger". Custom shows "Set up…" until limits are saved and then opens the window with the Custom limits dialog. After an automatic switch on plug or unplug, one line says what changed. Power limits are not in the panel.
+Only what is used daily: CPU temperature (the one large number) with package power and fan speeds, the four modes as a 2x2 grid (Silent, Balanced, Turbo, Custom), the charge limit and the keyboard light. Turbo is disabled on battery with "Needs charger". Custom shows "Set up…" until limits are saved and then opens the window with the Custom limits dialog. After an automatic switch on plug or unplug, one line says what changed. Power limits are not in the panel.
 
 ## Window
 

@@ -7,7 +7,7 @@ let normal = FanCurveData(performance)
 precondition(normal.points.count == 8 && normal.omitted == 0)
 precondition(normal.points.first?.temperature == 47 && normal.points.last?.duty == 53)
 
-// Real GA403WM Turbo firmware endpoint: never plot 255°C or clamp it to 105°C.
+// Real GA403WM Silent firmware curve (firmware index 1, read as "turbo" before AsusWmi 0.3.1): never plot 255°C or clamp it to 105°C.
 let turbo = FanCurveData([43, 68, 70, 72, 74, 76, 78, 255, 1, 6, 8, 13, 18, 22, 32, 32])
 precondition(turbo.points.count == 7 && turbo.omitted == 1)
 precondition(turbo.points.last?.temperature == 78)
