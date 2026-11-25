@@ -15,8 +15,10 @@
 ## What this release is
 
 - The tag is a merge of `80356b5` (StrixDgpuGate 0.2.12, branch `fix/eco-offbus`) and `44ee05c` (AsusWmi 0.3.1, branch
-  `fix/fan-curve-index`). It is the only tree whose versions equal the ones that run. `main` was not moved.
-- The assets are the binaries that ran on the test machine (boots of 2026-11-25 19:46 and 20:42), copied unchanged.
+  `fix/fan-curve-index`). It is the only tree whose versions equal the ones that run. It was merged into `main` with pull requests 16 and 17,
+  which it contains.
+- The assets are the binaries that ran on the test machine (boots of 2026-11-25 19:46 and 20:42); the kexts with debug
+  symbol entries stripped (same UUIDs, same code and data).
 - Not released: StrixDgpuGate 0.2.13 (the tip of `fix/eco-offbus`). It has never been loaded.
 
 ## Highlights
@@ -91,19 +93,21 @@ nobody recorded a separate test of that feature on Tahoe.
 1. Install and check gate 0.2.13 (the shutdown stamp).
 2. Sleep / wake and charger-plug tests with the RTX off the bus.
 3. Read the fan curves with AsusWmi 0.3.1 in Turbo and Silent.
-4. Merge pull requests 16 and 17 and this release into `main`; add StrixDgpuGate to CI packaging.
+4. Add StrixDgpuGate to CI packaging.
 5. HDMI without a restart: a feasibility study, not started.
 
 ## Assets
 
-All binaries are the ones that ran, byte for byte. Kexts are zipped with `ditto -c -k --keepParent`; the DMG was packed
+All binaries are the ones that ran. The three kexts had their debug symbol entries removed (`strip -S`: they carried build
+paths); their UUIDs are unchanged and every `__TEXT` / `__DATA` section and `Info.plist` is byte-identical to the EFI copies.
+The app, `rogkeyd` and `AmdCppcPolicy` are byte for byte the ones that ran. Kexts are zipped with `ditto -c -k --keepParent`; the DMG was packed
 on 2026-11-25 with `scripts/build-dmg.sh` around the installed app (the app inside is unchanged and its signature verifies).
 
 | File | Version | Source | UUID of the binary inside | SHA-256 of the file |
 |---|---|---|---|---|
-| `StrixDgpuGate-0.2.12.kext.zip` | 0.2.12 | `80356b5`; a rebuild of this tag gives identical loaded sections | `7AD92287-3A47-3405-8071-0C6CD6C4A8C1` | `0fb816ebfdb58a77af4f1d65a78ab6fe59564a8dcb9466e1baae52bfcefdc6c8` |
-| `AsusWmi-0.3.1.kext.zip` | 0.3.1 | `44ee05c`; a rebuild of this tag gives identical loaded sections | `42393DEB-8FB7-30D7-806B-CB360A619FEF` | `6dfbb47476054932cd70d8f50396251648d44263d06f9ad54b149d40c4cdc260` |
-| `AmdCppc-0.2.1.kext.zip` | 0.2.1 | built by GitHub Actions on or before 2026-11-03 (the source has not changed since 2026-10-12); the exact run is not recorded | `2EBD4419-8AB4-3795-BE16-9557A0E3BAFC` | `0c057d2b5e8870fb8e193dbde92e6e532f16fa364aa2b161804cf297331fa208` |
+| `StrixDgpuGate-0.2.12.kext.zip` | 0.2.12 | `80356b5`; a rebuild of this tag gives identical loaded sections | `7AD92287-3A47-3405-8071-0C6CD6C4A8C1` | `7a8a0dd5d20099c4423b58b7b800ea5f15f725da30ad31c96518b8ebf5444b71` |
+| `AsusWmi-0.3.1.kext.zip` | 0.3.1 | `44ee05c`; a rebuild of this tag gives identical loaded sections | `42393DEB-8FB7-30D7-806B-CB360A619FEF` | `0766d8509e3a044fec71435df679ffb02ac8891c85828ec9574c3d948347591d` |
+| `AmdCppc-0.2.1.kext.zip` | 0.2.1 | built by GitHub Actions on or before 2026-11-03 (the source has not changed since 2026-10-12); the exact run is not recorded | `2EBD4419-8AB4-3795-BE16-9557A0E3BAFC` | `89fba29ab889ece092553bf651f615e710a311afdf5dd286b5a11bf4a56c9d13` |
 | `RogControl-0.6.0.dmg` | 0.6.0 (build 12) | `01e0adb` (built 2026-11-10 10:04; a rebuild of this tag gives identical sections) | `CD6D0DF2-2CD2-3788-9D99-CF45E49CAEFC` | `4343db923f9f526836586eed3f32676ef1bb3d32c48047d1b0af9cd7f142af52` |
 | `RogControl-0.6.0.dmg.sha256` | n/a | written by `scripts/build-dmg.sh` | n/a | n/a |
 | `rogkeyd-1.2.app.zip` | 1.2 (build 3) | `8b02133` line, built 2026-11-05; `macos/RogKeys` is unchanged since 0.5.2 | `EFBCC204-9553-37E8-9351-78F3E02889CA` | `843afee6af1524cb45f7fa135ebb9e4a6266c99a95b5ee2b37c8bbc0d3ab263a` |
@@ -115,14 +119,13 @@ SHA-256 of the binaries inside:
 
 | Binary | SHA-256 |
 |---|---|
-| `StrixDgpuGate` | `d113ec41edcfd0a69393aea9158d855645945a8242ea6137f6ef6acd60d2176f` |
-| `AsusWmi` | `0ef9020439be12cb5cf1b35d2a13d21f839f0fef8afe630b0e16a72b842abff7` |
-| `AmdCppc` | `bd879adf39098b02d4960c8330dae5a4d45840e072ab743598d3f3bbea984e27` |
+| `StrixDgpuGate` | `0fc4b55d1cb356885c81d0b9a7d388aaaf56f2c384cdd5056d73ac4123c92f0d` |
+| `AsusWmi` | `e8963b2d2ab89db9d0c02452fc614271f0dae0bd9f7efe8ff5b6d2ce98afbeb8` |
+| `AmdCppc` | `e6a1553076322f90df0c9ad9126ead5f7ebb879856db619e30048bdd9d09bf89` |
 | `RogControl` | `1d547ec4240733c02e0d6f5784198d7409e3b1fb802e92189515fb3f79569138` |
 | `rogkeyd` | `765a527e1dd533a1933fa7f66839cd492501e06788dd27f7f4bc547ee9374737` |
 | `AmdCppcPolicy` | `a28e4d09a9781d9a2a34671278c904461acc0feab81eebf5d73e8be33071c7eb` |
 
-The kexts' symbol tables contain the build paths of the machine that built them.
 
 ## Licences
 

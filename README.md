@@ -146,14 +146,27 @@ back. It does not edit `config.plist`. AmdCppc and its policy daemon: [docs/CPU-
 
 ## Branches
 
-* `main`: release 0.5.2 (app, rogkeyd, AsusWmi, AmdCppc). The 0.6.0 line (GPU mode) is on `fix/eco-offbus` and
-  `fix/fan-curve-index`; `rogcontrol-v0.6.0` is their merge. The merge into `main` is open (pull requests 16 and 17).
+* `main`: release 0.6.0 (app, rogkeyd, AsusWmi 0.3.1, AmdCppc, StrixDgpuGate 0.2.12): the merge of `fix/eco-offbus` and
+  `fix/fan-curve-index`, which also carries pull requests 16 and 17. StrixDgpuGate 0.2.13 (never loaded) stays on `fix/eco-offbus`.
 * `dev/fn-hotkeys`: an earlier Fn key attempt through ATKD WMI, which never fires on this machine. Superseded by rogkeyd; not merged.
 * `dev/audio`: a from-scratch rewrite of the app with an audio page, the RogAudio HAL plug-in and mic chain. Speakers were
   still silent in audible tests when the branch was last touched. Not merged.
 
 The history of these files was split out of `thanhnndev/ga403wm-hackintosh` with `git filter-repo`; commits keep their
 original dates and authors.
+
+## Related repositories
+
+All of these belong to one project: macOS on one ASUS ROG Zephyrus G14 **GA403WM**.
+
+| Repository | What it is | Latest release |
+|---|---|---|
+| [ga403wm-hackintosh](https://github.com/thanhnndev/ga403wm-hackintosh) | The hub: OpenCore EFI, ACPI, install notes, state and roadmap, the small helper kexts | [v2 (macOS 26 Tahoe)](https://github.com/thanhnndev/ga403wm-hackintosh/releases/tag/v2) |
+| [mt7925-macos](https://github.com/thanhnndev/mt7925-macos) | MediaTek MT7925 Wi-Fi (`itlmt7925`, `itlmt7925Native`) and Bluetooth (`MtkBtFw`, `BtLeDlFix`) | Wi-Fi [v2.0-beta.1](https://github.com/thanhnndev/mt7925-macos/releases/tag/v2.0-beta.1), Bluetooth [bt-v1.1](https://github.com/thanhnndev/mt7925-macos/releases/tag/bt-v1.1) |
+| [rog-control-macos](https://github.com/thanhnndev/rog-control-macos) | RogControl app, `AsusWmi`, `AmdCppc`, `rogkeyd`, `StrixDgpuGate` (performance modes, fans, charge limit, GPU mode, Slash, Fn keys) | [rogcontrol-v0.6.0](https://github.com/thanhnndev/rog-control-macos/releases/tag/rogcontrol-v0.6.0) |
+| [nvidia-macos-driver](https://github.com/thanhnndev/nvidia-macos-driver) (fork of [nullmoth/nvidia-macos-driver](https://github.com/nullmoth/nvidia-macos-driver)) | The Radeon 890M display and Metal driver for this laptop (`NMXGPU` and its Metal plugin), PolyForm Noncommercial | source tags [ga403wm-890m-out50](https://github.com/thanhnndev/nvidia-macos-driver/releases/tag/ga403wm-890m-out50), [ga403wm-890m-plugin-a6cec1b](https://github.com/thanhnndev/nvidia-macos-driver/releases/tag/ga403wm-890m-plugin-a6cec1b) |
+| [ryzen-hypervisor.framework](https://github.com/thanhnndev/ryzen-hypervisor.framework) (fork of [OverlordDev/ryzen-hypervisor.framework](https://github.com/OverlordDev/ryzen-hypervisor.framework)) | AMD-V hypervisor for Docker and the Android emulator on Ryzen, with this machine's fixes | source tag [v0.7.24-ga403wm](https://github.com/thanhnndev/ryzen-hypervisor.framework/releases/tag/v0.7.24-ga403wm) |
+| [strix-890m-macos](https://github.com/thanhnndev/strix-890m-macos) | Earlier Radeon 890M research: notes, boot-display kexts, traces. Superseded by the driver above | none |
 
 ## Credits
 
