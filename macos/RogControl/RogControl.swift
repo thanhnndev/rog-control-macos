@@ -2037,7 +2037,7 @@ struct MicCameraTile: View {
                 .disabled(s.micMuted == nil)
             }
             if s.installed { clearMicRows }
-            Rectangle().fill(T.line).frame(height: 1).padding(.vertical, 10)
+            Rectangle().fill(T.line).frame(height: 1).padding(.vertical, s.installed ? 6 : 10)
             HStack {
                 state("Camera", s.camera == nil ? "Not found" : s.cameraInUse ? "In use" : "Off", live: s.cameraInUse)
                 Spacer()
@@ -2056,17 +2056,15 @@ struct MicCameraTile: View {
                 Toggle("Clear Mic", isOn: Binding(get: { s.clearMic }, set: { m.setClearMic($0) })).toggleStyle(.switch).labelsHidden().tint(T.red)
                     .disabled(!s.rog)
             }
-            .padding(.top, 8)
+            .padding(.top, 4)
             HStack {
-                VStack(alignment: .leading, spacing: 1) {
-                    Text("Noise reduction").font(.system(size: 12)).foregroundStyle(T.text)
-                    Text(s.clearMic ? "Filters fans and room noise from ROG Clear Mic" : "Works with Clear Mic on").font(.system(size: 10.5)).foregroundStyle(T.dim)
-                }
+                Text("Noise reduction").font(.system(size: 12)).foregroundStyle(s.clearMic ? T.text : T.dim)
                 Spacer()
                 Toggle("Noise reduction", isOn: Binding(get: { s.noise }, set: { m.setNoise($0) })).toggleStyle(.switch).labelsHidden().tint(T.red)
                     .disabled(!s.rog || !s.clearMic)
             }
-            .padding(.top, 6)
+            .padding(.top, 2)
+            .help(s.clearMic ? "Filters fan and room noise from ROG Clear Mic" : "Works with Clear Mic on")
     }
     // a red dot marks live capture; the word says it too, so the colour never carries it alone
     func state(_ title: String, _ value: String, live: Bool) -> some View {
