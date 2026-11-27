@@ -5,8 +5,8 @@
 **ROG Control for macOS on the ASUS ROG Zephyrus G14 (GA403WM):** performance modes, power limits, fans, battery charge
 limit, GPU mode, lighting and Fn keys from a menu bar app, backed by three kexts.
 
-<p align="center"><img src="docs/images/rogcontrol-window.png" alt="ROG Control 0.6.0 window: live readings, mode, battery, custom limits, lighting, sound, GPU mode and diagnostics" width="860"></p>
-<p align="center"><em>ROG Control 0.6.0, the whole window with Diagnostics open. Screenshots are offscreen renders with sample values.</em></p>
+<p align="center"><img src="docs/images/rogcontrol-window.png" alt="ROG Control 0.6.1 window: live readings, mode, battery, custom limits, GPU mode, sound, microphone and lighting" width="860"></p>
+<p align="center"><em>ROG Control 0.6.1, the whole window (it fits a 1440 x 900 screen; Diagnostics opens as a dialog). Screenshots are offscreen renders with sample values.</em></p>
 
 <p align="center"><img src="docs/images/rogcontrol-popover.png" alt="ROG Control menu bar panel with the GPU row" width="320"></p>
 <p align="center"><em>Menu bar panel</em></p>
@@ -56,7 +56,7 @@ ASUS model. The power-limit ranges are the GA403WM's.
 | `AsusWmi.kext` 0.3.1 | `kexts/AsusWmi` | Matches the ACPI `ATKD` device (`PNP0C14`, `_UID "ATK"`) and calls its WMI methods like `asus-wmi`: platform profile, PPT limits (range-checked for AC or battery), fan curves, fan speeds, charge limit, keyboard light and Aura (N-KEY HID reports), Slash lighting, the Fn keys rogkeyd passes on, GPU state and the stored GPU mode (ABI 6) |
 | `StrixDgpuGate.kext` 0.2.12 | `kexts/StrixDgpuGate` | GPU mode. In Eco it claims the RTX before the NVIDIA driver, powers it off through the firmware's own ACPI path and removes it from the PCI bus. Does nothing outside macOS 26 (Darwin 25.x). Details and switches: [docs/GPU-MODE.md](docs/GPU-MODE.md) |
 | `AmdCppc.kext` 0.2.1 | `kexts/AmdCppc` | Ryzen AI 9 HX 370: Tctl and package power (`debug.amdcppc.sensors`), per-CPU clocks (`debug.amdcppc.freq`), CPPC boost and EPP controls. The MSR writes are gated to Strix Point (family 1Ah, model 24h): on other Ryzen CPUs (Zen 4 GA403UV, #11) boost, EPP and P-state writes do nothing |
-| `RogControl.app` 0.6.0 | `macos/RogControl` | SwiftUI menu bar app plus a window: mode, live readings, battery, Custom limits, lighting, sound, microphone and camera, GPU mode, diagnostics, and a Doctor that checks the whole setup. Talks to AsusWmi through its user client, no sudo. One copy per user |
+| `RogControl.app` 0.6.1 | `macos/RogControl` | SwiftUI menu bar app plus a window: mode, live readings, battery, Custom limits, lighting, sound, microphone and camera, GPU mode, diagnostics, and a Doctor that checks the whole setup. Talks to AsusWmi through its user client, no sudo. One copy per user |
 | `rogkeyd.app` 1.2 | `macos/RogKeys` | LaunchAgent that reads the N-KEY Fn keys (vendor report 0x5A), which macOS drops, and hands them to AsusWmi; does mic mute, airplane mode, Fn+F9 and M4 itself. Needs Input Monitoring (and Accessibility for Fn+F9) |
 | `AmdCppcPolicy` | `macos/AmdCppcPolicy` | Root LaunchDaemon that applies the CPPC policy after boot and wake (EPP per profile as asusctl's defaults) |
 
@@ -104,6 +104,7 @@ Known issues:
 
 | Release | Contents |
 |---|---|
+| `rogcontrol-v0.6.1` | `AsusWmi-0.3.3.kext.zip` (manual power limits report success, measured 25 W cap); the other files as in 0.6.0. RogControl 0.6.1 (window fits the screen) is in hub release [v2.1](https://github.com/thanhnndev/ga403wm-hackintosh/releases/tag/v2.1) |
 | `rogcontrol-v0.6.0` | GPU mode. `RogControl-0.6.0.dmg`, `StrixDgpuGate-0.2.12.kext.zip`, `AsusWmi-0.3.1.kext.zip`, `AmdCppc-0.2.1.kext.zip`, `rogkeyd-1.2.app.zip`, `AmdCppcPolicy.zip`: the binaries that run on the test machine. Notes: [.github/release-notes/rogcontrol-v0.6.0.md](.github/release-notes/rogcontrol-v0.6.0.md) |
 | [rogcontrol-v0.5.2](https://github.com/thanhnndev/rog-control-macos/releases/tag/rogcontrol-v0.5.2) | `RogControl-0.5.2.dmg`: Doctor (checks and guided fixes), Aura control, sound row on the grid, one copy per user. `AsusWmi-0.2.2.kext.zip` (Fn keys, Aura, the Fn+F7/F8 panic fix; ABI 5) and `rogkeyd-1.2.app.zip` (Fn keys reader); see [docs/FN-HOTKEYS.md](docs/FN-HOTKEYS.md) |
 | [rogcontrol-v0.4.0](https://github.com/thanhnndev/rog-control-macos/releases/tag/rogcontrol-v0.4.0) | `RogControl-0.4.0.dmg`: sound output, sound profile, microphone, Clear Mic and camera |
@@ -163,7 +164,7 @@ All of these belong to one project: macOS on one ASUS ROG Zephyrus G14 **GA403WM
 |---|---|---|
 | [ga403wm-hackintosh](https://github.com/thanhnndev/ga403wm-hackintosh) | The hub: OpenCore EFI, ACPI, install notes, state and roadmap, the small helper kexts | [v2 (macOS 26 Tahoe)](https://github.com/thanhnndev/ga403wm-hackintosh/releases/tag/v2) |
 | [mt7925-macos](https://github.com/thanhnndev/mt7925-macos) | MediaTek MT7925 Wi-Fi (`itlmt7925`, `itlmt7925Native`) and Bluetooth (`MtkBtFw`, `BtLeDlFix`) | Wi-Fi [v2.0-beta.1](https://github.com/thanhnndev/mt7925-macos/releases/tag/v2.0-beta.1), Bluetooth [bt-v1.1](https://github.com/thanhnndev/mt7925-macos/releases/tag/bt-v1.1) |
-| [rog-control-macos](https://github.com/thanhnndev/rog-control-macos) | RogControl app, `AsusWmi`, `AmdCppc`, `rogkeyd`, `StrixDgpuGate` (performance modes, fans, charge limit, GPU mode, Slash, Fn keys) | [rogcontrol-v0.6.0](https://github.com/thanhnndev/rog-control-macos/releases/tag/rogcontrol-v0.6.0) |
+| [rog-control-macos](https://github.com/thanhnndev/rog-control-macos) | RogControl app, `AsusWmi`, `AmdCppc`, `rogkeyd`, `StrixDgpuGate` (performance modes, fans, charge limit, GPU mode, Slash, Fn keys) | [rogcontrol-v0.6.1](https://github.com/thanhnndev/rog-control-macos/releases/tag/rogcontrol-v0.6.1) |
 | [nvidia-macos-driver](https://github.com/thanhnndev/nvidia-macos-driver) (fork of [nullmoth/nvidia-macos-driver](https://github.com/nullmoth/nvidia-macos-driver)) | The Radeon 890M display and Metal driver for this laptop (`NMXGPU` and its Metal plugin), PolyForm Noncommercial | source tags [ga403wm-890m-out50](https://github.com/thanhnndev/nvidia-macos-driver/releases/tag/ga403wm-890m-out50), [ga403wm-890m-plugin-a6cec1b](https://github.com/thanhnndev/nvidia-macos-driver/releases/tag/ga403wm-890m-plugin-a6cec1b) |
 | [ryzen-hypervisor.framework](https://github.com/thanhnndev/ryzen-hypervisor.framework) (fork of [OverlordDev/ryzen-hypervisor.framework](https://github.com/OverlordDev/ryzen-hypervisor.framework)) | AMD-V hypervisor for Docker and the Android emulator on Ryzen, with this machine's fixes | source tag [v0.7.24-ga403wm](https://github.com/thanhnndev/ryzen-hypervisor.framework/releases/tag/v0.7.24-ga403wm) |
 | [strix-890m-macos](https://github.com/thanhnndev/strix-890m-macos) | Earlier Radeon 890M research: notes, boot-display kexts, traces. Superseded by the driver above | none |
