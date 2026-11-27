@@ -442,8 +442,8 @@ enum Apply {
             guard let c = Asus.fanCurve(fan: fan, profile: base.firmwareProfile) else { return "could not read the fan curve" }
             let r = Asus.setFanCurve(fan: fan, c)
             if r == kIOReturnBadArgument {
-                // AsusWmi's own checks (temperatures 20..105 C and rising, duties not falling, top point >= 40 %) rejected
-                // the firmware curve before anything was sent to the EC.
+                // AsusWmi's own checks rejected the curve before anything was sent to the EC (0.3.1 refused some firmware
+                // curves, such as the GA403WM Silent ones; 0.3.2 accepts the firmware's own curves as they are).
                 return "the \(fan == 0 ? "CPU" : "GPU") firmware fan curve did not pass AsusWmi's checks (\(c.prefix(8).map(String.init).joined(separator: "/")) C, \(c.suffix(8).map(String.init).joined(separator: "/")) %)"
             }
             guard r == KERN_SUCCESS else { return "the \(fan == 0 ? "CPU" : "GPU") fan curve was refused by the firmware (\(String(format: "0x%08x", r)), see asus-log in ioreg)" }

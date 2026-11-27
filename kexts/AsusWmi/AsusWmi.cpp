@@ -127,6 +127,7 @@ public:
     IOReturn setValue(int what, int value);
     IOReturn fanRead(int fan, int profile, uint8_t out[16]);
     IOReturn fanWrite(int fan, const uint8_t in[16]);
+    bool fanIsFirmwareCurve(int fan, const uint8_t c[16]);
     IOReturn fanReset();
     IOReturn fanCustomFromFirmware();
     void getState(uint32_t st[ASUS_ST_COUNT]);
@@ -611,15 +612,46 @@ IOReturn AsusWmi::fanRead(int fan, int profile, uint8_t out[16])
 }
 
 // Custom curve: DEVS with the 8 temperatures packed into arg1/arg2 and the 8 duties into arg3/arg4, low byte first
-// (asus-wmi fan_curve_write). Checked here: temperatures rising, duties not falling, and at least 40 % at the top point.
+// (asus-wmi fan_curve_write).
+// Checks (0.3.2). A curve byte-for-byte equal to one of the firmware's own three curves for this fan is accepted as it
+// is: RogControl's Manual mode writes those back, and the firmware ships curves our checks used to refuse. Real GA403WM
+// samples: Silent CPU 43,68,70,72,74,76,78,255 C / 1,6,8,13,18,22,32,32 %, Silent GPU 43,67,68,70,70,70,70,255 C (same
+// duties): an unused 255 C last point, repeated temperatures and a 32 % top point; 0.3.1 refused both, and with them the
+// power limits. Any other curve: temperatures 20..105 C and not falling (equal neighbours allowed, as asus-wmi's
+// fan_curve_validate), trailing points may be the firmware's unused 255 C marker, duties 0..100 and not falling, and the
+// last used point at least 40 % (our own floor for hand-made curves; neither asus-wmi nor G-Helper has one).
+bool AsusWmi::fanIsFirmwareCurve(int fan, const uint8_t c[16])
+{
+    for (int profile = 0; profile < 3; profile++) {
+        uint8_t f[16];
+        if (fanRead(fan, profile, f) == kIOReturnSuccess && memcmp(f, c, 16) == 0) return true;
+    }
+    return false;
+}
+
+static bool fanCurveSane(const uint8_t c[16])
+{
+    int used = 8;
+    while (used > 0 && c[used - 1] == 255) used--;                 // trailing unused points (firmware marker)
+    if (used < 2) return false;
+    for (int i = 0; i < 8; i++) {
+        if (c[8 + i] > 100) return false;
+        if (i && c[8 + i] < c[8 + i - 1]) return false;
+        if (i >= used) continue;
+        if (c[i] < 20 || c[i] > 105) return false;
+        if (i && c[i] < c[i - 1]) return false;
+    }
+    return c[8 + used - 1] >= 40;
+}
+
 IOReturn AsusWmi::fanWrite(int fan, const uint8_t c[16])
 {
     if (fan < 0 || fan > 1) return kIOReturnBadArgument;
-    for (int i = 0; i < 8; i++) {
-        if (c[i] < 20 || c[i] > 105 || c[8 + i] > 100) return kIOReturnBadArgument;
-        if (i && (c[i] <= c[i - 1] || c[8 + i] < c[8 + i - 1])) return kIOReturnBadArgument;
+    const bool firmware = fanIsFirmwareCurve(fan, c);
+    if (!firmware && !fanCurveSane(c)) {
+        say("fan %d curve %u/%u..%u/%u refused by the checks", fan, c[0], c[8], c[7], c[15]);
+        return kIOReturnBadArgument;
     }
-    if (c[15] < 40) return kIOReturnBadArgument;
     uint32_t a[5] = { (uint32_t)(fan ? DEV_GPU_CURVE : DEV_CPU_CURVE), 0, 0, 0, 0 };
     for (int i = 0; i < 4; i++) {
         a[1] |= (uint32_t)c[i] << (8 * i);
@@ -630,7 +662,8 @@ IOReturn AsusWmi::fanWrite(int fan, const uint8_t c[16])
     uint32_t ret = 0;
     bool ok = wmi5(M_DEVS, a, &ret) && ret != WMI_UNSUPPORTED;
     if (ok) fanCustom = true;
-    say("fan %d curve %u/%u..%u/%u -> %s ret %08x", fan, c[0], c[8], c[7], c[15], ok ? "ok" : "failed", ret);
+    say("fan %d %s curve %u/%u..%u/%u -> %s ret %08x", fan, firmware ? "firmware" : "custom", c[0], c[8], c[7], c[15],
+        ok ? "ok" : "failed", ret);
     return ok ? kIOReturnSuccess : kIOReturnIOError;
 }
 
