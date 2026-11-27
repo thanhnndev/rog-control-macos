@@ -264,6 +264,8 @@ struct SoundState {
     var micInUse = false
     var camera: String?                  // camera name; nil when none is attached
     var cameraInUse = false
+    var installed = false                // rogaudiod is installed (its LaunchAgent or status file exists); the RogAudio controls hide otherwise
+    var noise = true                     // mic noise reduction (settings noiseCancellation)
 }
 
 enum Sound {
@@ -324,6 +326,13 @@ enum Sound {
         return AudioObjectSetPropertyData(d, &a, 0, nil, 4, &v) == 0
     }
 
+    static let agents = ["/Library/LaunchAgents/com.itlmt7925.rogaudiod.plist",
+                         FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/LaunchAgents/com.itlmt7925.rogaudiod.plist").path]
+    // keys written in the last 3 s show the requested value; after that the value rogaudiod reports in status.plist
+    // (it rewrites that file every second), so the UI never keeps a value of its own
+    static var written: [String: Date] = [:]
+    static func fresh(_ k: String) -> Bool { written[k].map { Date().timeIntervalSince($0) < 3 } ?? false }
+
     static func plist(_ name: String) -> [String: Any] {
         guard let d = try? Data(contentsOf: dir.appendingPathComponent(name)),
               let p = try? PropertyListSerialization.propertyList(from: d, format: nil) as? [String: Any] else { return [:] }
@@ -332,7 +341,7 @@ enum Sound {
     // merges the change into rogaudiod's settings file (strixampctl reads the same file for the amp volume and mute)
     static func write(_ change: [String: Any]) -> Bool {
         var p = plist("settings.plist")
-        for (k, v) in change { p[k] = v }
+        for (k, v) in change { p[k] = v; written[k] = Date() }
         guard let d = try? PropertyListSerialization.data(fromPropertyList: p, format: .xml, options: 0) else { return false }
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return (try? d.write(to: dir.appendingPathComponent("settings.plist"), options: .atomic)) != nil
@@ -349,8 +358,13 @@ enum Sound {
         let updated = (status["updated"] as? Double) ?? 0
         st.daemon = abs(Date().timeIntervalSince1970 - updated) < 10
         st.chain = st.daemon && (status["speakerActive"] as? Bool ?? false)
-        st.profile = settings["profile"] as? String ?? "balanced"
-        st.clearMic = settings["micEnabled"] as? Bool ?? false
+        st.installed = st.daemon || agents.contains { FileManager.default.fileExists(atPath: $0) }
+        let live = { (k: String) in st.daemon && !fresh(k) }      // read what rogaudiod applied, not what was asked
+        st.profile = (live("profile") ? status["profile"] : settings["profile"]) as? String ?? "balanced"
+        st.clearMic = (live("micEnabled") ? status["micEnabled"] : settings["micEnabled"]) as? Bool ?? false
+        // status.plist reports the applied strength, 0 while noise reduction is off; rogaudiod's default is on
+        if live("noiseCancellation"), let applied = status["strength"] as? Double { st.noise = applied > 0 }
+        else { st.noise = settings["noiseCancellation"] as? Bool ?? true }
         if let mic = builtinInput() {
             st.micMuted = mute(mic)
             st.micInUse = running(mic) || (byUID(micUID).map(running) ?? false)
@@ -698,6 +712,10 @@ final class RogModel: ObservableObject {
         sound = Sound.state()
     }
     // mutes the built-in mic itself, so the direct input and ROG Clear Mic both go silent
+    func setNoise(_ on: Bool) {
+        soundError = Sound.write(["noiseCancellation": on]) ? "" : "The noise reduction setting was not saved."
+        sound = Sound.state()
+    }
     func setMicMute(_ on: Bool) {
         guard let mic = Sound.builtinInput(), Sound.setMute(mic, on) else { soundError = "The microphone could not be \(on ? "muted" : "unmuted")."; return }
         soundError = ""
@@ -1940,6 +1958,11 @@ struct SoundTile: View {
             .padding(.top, 10)
             if s.outputs.isEmpty { Text("No output device").font(.system(size: 11)).foregroundStyle(T.dim).padding(.top, 10) }
             Spacer(minLength: 14)
+            if s.installed { profileRow }
+            ErrorLine(text: m.soundError).padding(.top, 6)
+        }
+    }
+    @ViewBuilder var profileRow: some View {
             HStack {
                 Caps("Sound profile"); Spacer()
                 if s.output?.isRogSpeakers != true && s.rog {
@@ -1963,8 +1986,6 @@ struct SoundTile: View {
             .padding(.top, 8)
             .disabled(!s.rog).opacity(s.rog ? 1 : 0.5)
             .animation(.easeOut(duration: 0.15), value: s.profile)
-            ErrorLine(text: m.soundError).padding(.top, 6)
-        }
     }
 }
 
@@ -2015,17 +2036,8 @@ struct MicCameraTile: View {
                 }
                 .disabled(s.micMuted == nil)
             }
-            HStack {
-                VStack(alignment: .leading, spacing: 1) {
-                    Text("Clear Mic").font(.system(size: 12)).foregroundStyle(T.text)
-                    Text(s.rog ? "Noise reduction, apps record from ROG Clear Mic" : "Needs RogAudio").font(.system(size: 10.5)).foregroundStyle(T.dim)
-                }
-                Spacer()
-                Toggle("Clear Mic", isOn: Binding(get: { s.clearMic }, set: { m.setClearMic($0) })).toggleStyle(.switch).labelsHidden().tint(T.red)
-                    .disabled(!s.rog)
-            }
-            .padding(.top, 8)
-            Rectangle().fill(T.line).frame(height: 1).padding(.vertical, 10)
+            if s.installed { clearMicRows }
+            Rectangle().fill(T.line).frame(height: 1).padding(.vertical, s.installed ? 6 : 10)
             HStack {
                 state("Camera", s.camera == nil ? "Not found" : s.cameraInUse ? "In use" : "Off", live: s.cameraInUse)
                 Spacer()
@@ -2033,6 +2045,26 @@ struct MicCameraTile: View {
             }
             .help("The firmware has no camera switch; macOS shows which app uses it in Control Center")
         }
+    }
+    @ViewBuilder var clearMicRows: some View {
+            HStack {
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Clear Mic").font(.system(size: 12)).foregroundStyle(T.text)
+                    Text(s.rog ? "Apps record from ROG Clear Mic" : "Needs RogAudio").font(.system(size: 10.5)).foregroundStyle(T.dim)
+                }
+                Spacer()
+                Toggle("Clear Mic", isOn: Binding(get: { s.clearMic }, set: { m.setClearMic($0) })).toggleStyle(.switch).labelsHidden().tint(T.red)
+                    .disabled(!s.rog)
+            }
+            .padding(.top, 4)
+            HStack {
+                Text("Noise reduction").font(.system(size: 12)).foregroundStyle(s.clearMic ? T.text : T.dim)
+                Spacer()
+                Toggle("Noise reduction", isOn: Binding(get: { s.noise }, set: { m.setNoise($0) })).toggleStyle(.switch).labelsHidden().tint(T.red)
+                    .disabled(!s.rog || !s.clearMic)
+            }
+            .padding(.top, 2)
+            .help(s.clearMic ? "Filters fan and room noise from ROG Clear Mic" : "Works with Clear Mic on")
     }
     // a red dot marks live capture; the word says it too, so the colour never carries it alone
     func state(_ title: String, _ value: String, live: Bool) -> some View {
@@ -2999,7 +3031,7 @@ enum Snapshot {
         m.sound = SoundState(outputs: [rogOut, AudioDevice(id: 92, uid: "builtin", name: "Built-in Output", builtin: true)],
                              output: rogOut, input: AudioDevice(id: 47, uid: Sound.micUID, name: "ROG Clear Mic", builtin: false),
                              rog: true, daemon: true, chain: true, profile: "balanced", clearMic: true, micMuted: false, micInUse: true,
-                             camera: "ASUS FHD webcam", cameraInUse: false)
+                             camera: "ASUS FHD webcam", cameraInUse: false, installed: true, noise: true)
         m.seedHistory()
         return m
     }
