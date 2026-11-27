@@ -210,6 +210,8 @@ void AsusWmi::say(const char *fmt, ...)
 // ATKD.WMNB(instance 0, method id, buffer { arg0 .. arg4 }) -> integer, as wmi_evaluate_method() with the asus-wmi args.
 // The buffer must be 20 bytes: this BIOS's WMNB starts with CreateDWordField (Arg2, 0x10, IIA4), and a shorter buffer
 // aborts the method (AE_AML_BUFFER_LIMIT) before it looks at the method id; Linux's struct bios_args is 5 dwords too.
+static IOReturn gWmiEval = kIOReturnSuccess;      // the last WMNB evaluateObject result (callers hold the driver lock)
+
 static bool wmiCall(IOACPIPlatformDevice *atk, uint32_t method, const uint32_t a[5], OSObject **result)
 {
     OSNumber *inst = OSNumber::withNumber(0ull, 32), *mid = OSNumber::withNumber((unsigned long long)method, 32);
@@ -217,8 +219,9 @@ static bool wmiCall(IOACPIPlatformDevice *atk, uint32_t method, const uint32_t a
     bool ok = false;
     if (inst && mid && buf) {
         OSObject *params[3] = { inst, mid, buf };
-        ok = atk->evaluateObject("WMNB", result, params, 3) == kIOReturnSuccess;
-    }
+        gWmiEval = atk->evaluateObject("WMNB", result, params, 3);
+        ok = gWmiEval == kIOReturnSuccess;
+    } else gWmiEval = kIOReturnNoMemory;
     if (inst) inst->release();
     if (mid) mid->release();
     if (buf) buf->release();
@@ -567,6 +570,15 @@ IOReturn AsusWmi::setValue(int what, int v)
         if (v < r.lo || v > r.hi) return kIOReturnBadArgument;
         if (!fanCustom) return kIOReturnNotPermitted;            // asus-armoury: PPT needs an active custom fan curve here
         ok = devs(kPptDev[i], (uint32_t)v, &ret);
+        // This BIOS: WMNB 0x001200A3/A0/C1 -> \_SB.ALIB (0x0C, UTDP) -> "Local0 = A032 (Arg1)". A032 sends the SMU message
+        // (A018 0x14 SPL, 0x16 SPPT, 0x15 FPPT) and then ends without a Return for these ids (only id 0x30 returns), so
+        // storing its result fails (no return value), ALIB and WMNB abort before "Return (One)", and evaluateObject reports
+        // an error after the limit was already sent. Same BIOS pattern as A026 in ACAD._PSR (patched in the EFI). Count an
+        // AML error here as sent, log the IOReturn, and leave the check to the measured package power.
+        if (!ok && gWmiEval != kIOReturnSuccess && gWmiEval != kIOReturnNoMemory) {
+            say("ppt %d=%d: WMNB AML error %08x after ALIB 0x0C (A032 has no Return), counted as sent", i, v, gWmiEval);
+            ok = true;
+        }
         if (ok) pptSet[i] = (uint32_t)v;
         break;
     }
