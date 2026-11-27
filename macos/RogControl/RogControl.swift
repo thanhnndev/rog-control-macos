@@ -440,7 +440,13 @@ enum Apply {
         let base = s.fanBase == .turbo && !st.ac ? Mode.performance : s.fanBase
         for fan in 0..<2 {
             guard let c = Asus.fanCurve(fan: fan, profile: base.firmwareProfile) else { return "could not read the fan curve" }
-            guard Asus.setFanCurve(fan: fan, c) == KERN_SUCCESS else { return "the fan curve was refused" }
+            let r = Asus.setFanCurve(fan: fan, c)
+            if r == kIOReturnBadArgument {
+                // AsusWmi's own checks (temperatures 20..105 C and rising, duties not falling, top point >= 40 %) rejected
+                // the firmware curve before anything was sent to the EC.
+                return "the \(fan == 0 ? "CPU" : "GPU") firmware fan curve did not pass AsusWmi's checks (\(c.prefix(8).map(String.init).joined(separator: "/")) C, \(c.suffix(8).map(String.init).joined(separator: "/")) %)"
+            }
+            guard r == KERN_SUCCESS else { return "the \(fan == 0 ? "CPU" : "GPU") fan curve was refused by the firmware (\(String(format: "0x%08x", r)), see asus-log in ioreg)" }
         }
         let r = st.ranges
         let spl = min(max(s.spl, r[0].0), r[0].1)
