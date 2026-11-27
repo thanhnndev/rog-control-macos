@@ -474,7 +474,6 @@ final class RogModel: ObservableObject {
     @Published var gpuError = ""
     @Published var gate = GateInfo()
     @Published var cpuPol = CpuPolicy()
-    @Published var diagOpen = false
     @Published var loginEnabled = LoginItem.enabled
     @Published var curve: [UInt8]? = nil
     @Published var gpuCurve: [UInt8]? = nil
@@ -1036,7 +1035,7 @@ struct ContentView: View {
     }
 
     private func row<C: View>(_ title: String, @ViewBuilder control: () -> C) -> some View {
-        HStack { Text(title).font(.system(size: 11.5)).foregroundStyle(T.text); Spacer(minLength: 8); control() }.frame(height: 40)
+        HStack { Text(title).font(.system(size: 11.5)).foregroundStyle(T.text); Spacer(minLength: 8); control() }.frame(height: 30)
     }
 }
 
@@ -1350,7 +1349,7 @@ struct LiveChart: View {
 // Anything that is set up once (Custom limits, fan curves, Slash animations, battery details, settings) opens as a dialog over
 // the screen instead of a page behind a side menu.
 enum RogDialog: String, Identifiable {
-    case limits, fans, slash, battery, settings, doctor
+    case limits, fans, slash, battery, settings, doctor, diagnostics
     var id: String { rawValue }
     var title: String {
         switch self {
@@ -1360,9 +1359,10 @@ enum RogDialog: String, Identifiable {
         case .battery: return "Battery"
         case .settings: return "Settings"
         case .doctor: return "Doctor"
+        case .diagnostics: return "Diagnostics"
         }
     }
-    var width: CGFloat { self == .limits ? 820 : self == .slash ? 900 : self == .settings ? 560 : self == .doctor ? 760 : 680 }
+    var width: CGFloat { self == .limits ? 820 : self == .slash ? 900 : self == .settings ? 560 : self == .doctor ? 760 : self == .diagnostics ? 960 : 680 }
 }
 
 struct TileHead: View {           // tile title, with an opener for its dialog on the right
@@ -1400,10 +1400,10 @@ struct RogWindowView: View {
                     ModeCard(m: m).frame(width: 350)
                 }
                 .fixedSize(horizontal: false, vertical: true)
-                HStack(alignment: .top, spacing: 12) {
-                    BatteryTile(m: m)
-                    LimitsTile(m: m)
-                    LightingTile(m: m)
+                HStack(alignment: .top, spacing: 12) {    // power: battery, CPU limits, GPU
+                    BatteryTile(m: m).frame(width: Self.column)
+                    LimitsTile(m: m).frame(width: Self.column)
+                    GpuTile(m: m)
                 }
                 .fixedSize(horizontal: false, vertical: true)
             }
@@ -1413,10 +1413,9 @@ struct RogWindowView: View {
                 MicCameraTile(m: m)
             }
             .fixedSize(horizontal: false, vertical: true)
-            GpuTile(m: m).fixedSize(horizontal: false, vertical: true)
-            DiagnosticsCard(m: m).fixedSize(horizontal: false, vertical: true)
+            LightingTile(m: m).fixedSize(horizontal: false, vertical: true).disabled(!m.st.present)
         }
-        .padding(.horizontal, 18).padding(.bottom, 18)
+        .padding(.horizontal, 18).padding(.bottom, 14)
         .frame(width: 1120, alignment: .topLeading)
         .fixedSize(horizontal: false, vertical: true)
         .padding(.top, -27)              // pull the header up into the 28 pt title bar, level with the traffic lights
@@ -1442,6 +1441,7 @@ struct RogWindowView: View {
             Spacer()
             chip(dot: m.st.present ? .green : T.amber, m.st.present ? "AsusWmi connected" : "AsusWmi not loaded, controls are off until it loads through OpenCore")
             if m.st.present { chip(icon: m.st.ac ? "powerplug.fill" : "battery.75percent", m.st.ac ? "On charger" : "On battery") }
+            diagnosticsButton
             doctorButton
             Button { m.dialog = .settings } label: {
                 Image(systemName: "gearshape.fill").font(.system(size: 12)).foregroundStyle(T.dim).frame(width: 28, height: 26)
@@ -1451,6 +1451,13 @@ struct RogWindowView: View {
         .frame(height: 28)
     }
     // Doctor: the worst result colours the icon, and the count of problems is spelled out next to it
+    var diagnosticsButton: some View {
+        Button { m.dialog = .diagnostics } label: {
+            Image(systemName: "waveform.path.ecg").font(.system(size: 11, weight: .semibold)).foregroundStyle(T.dim).frame(width: 28, height: 26)
+        }
+        .buttonStyle(RogButtonStyle(cut: 6)).help("Diagnostics: GPU gate, power-source heartbeat, CPU policy")
+        .accessibilityLabel("Diagnostics")
+    }
     var doctorButton: some View {
         let issues = m.doctor.filter { $0.level >= .warn }
         let worst = m.doctor.map(\.level).max() ?? .ok
@@ -1507,7 +1514,7 @@ struct LiveCard: View {
                     legend(T.red, "Temperature", dashed: false)
                     legend(Color.white.opacity(0.55), "Power", dashed: true)
                 }
-                LiveChart(samples: m.history, height: 150)
+                LiveChart(samples: m.history, height: 96)
             }
             .padding(.top, 10)
         }
@@ -1549,7 +1556,7 @@ struct ModeCard: View {
     var body: some View {
         Card(pad: 14, stretch: true) {
             TileHead(title: "Mode")
-            VStack(spacing: 6) {
+            VStack(spacing: 5) {
                 ForEach(Mode.allCases) { mode in row(mode) }
             }
             .padding(.top, 10)
@@ -1570,15 +1577,15 @@ struct ModeCard: View {
             if mode == .manual && !m.customReady { m.dialog = .limits } else { m.choose(mode) }
         } label: {
             HStack(spacing: 10) {
-                ModeBadge(mode: mode, active: on, size: 26)
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(mode.title).font(T.num(12.5)).foregroundStyle(T.text)
+                ModeBadge(mode: mode, active: on, size: 22)
+                Text(mode.title).font(T.num(12.5)).foregroundStyle(T.text)
+                if mode == .manual || unavailable {      // the others explain themselves; their text is in the tooltip
                     Text(desc).font(.system(size: 10.5)).foregroundStyle(T.dim).lineLimit(1)
                 }
                 Spacer(minLength: 4)
                 Segments(lit: mode.level, total: 4, height: 5, color: on ? T.red : Color.white.opacity(0.4)).frame(width: 40)
             }
-            .padding(.horizontal, 10).frame(height: 46)
+            .padding(.horizontal, 10).frame(height: 34)
             .background(on ? T.red.opacity(0.12) : T.raised.opacity(0.6), in: Chamfer(cut: 8))
             .overlay(Chamfer(cut: 8).stroke(on ? T.red : Color.clear))
             .contentShape(Chamfer(cut: 8))
@@ -1586,6 +1593,7 @@ struct ModeCard: View {
         .buttonStyle(.plain)
         .disabled(unavailable)
         .opacity(unavailable ? 0.45 : 1)
+        .help(desc)
         .accessibilityLabel(mode.title).accessibilityHint(desc).accessibilityAddTraits(on ? .isSelected : [])
     }
     func sourceRow(ac: Bool) -> some View {
@@ -1620,65 +1628,68 @@ struct GpuTile: View {
         ("Standard", "square.split.2x1.fill", "Hybrid: the RTX is on and drives the HDMI port."),
         ("Optimized", "bolt.badge.automatic.fill", "Eco when the computer starts on battery, Standard when it starts on the charger."),
     ]
+    static let short = ["RTX off, longest battery. HDMI does not work.", "RTX on, it drives the HDMI port.",
+                        "Eco on battery, Standard on the charger, at start."]
     var order: [Int] { [1, 0, 2] }          // Eco, Standard, Optimized as in G-Helper (stored values: 0 standard, 1 eco, 2 optimized)
     var body: some View {
         let g = m.gpu
         let usable = g.present && g.supported && g.nvramOK
         let pending = g.pending(ac: m.st.ac)
-        Card(pad: 14) {
+        Card(pad: 14, stretch: true) {
             TileHead(title: "GPU mode")
-            HStack(alignment: .top, spacing: 18) {
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack(spacing: 8) {
-                        ForEach(order, id: \.self) { v in
-                            let info = Self.modes[v == 1 ? 0 : v == 0 ? 1 : 2]
-                            Button { m.setGpuMode(v) } label: {
-                                VStack(spacing: 4) {
-                                    Image(systemName: info.1).font(.system(size: 14))
-                                    Text(info.0).font(.system(size: 12, weight: g.mode == v ? .semibold : .regular))
-                                }
-                                .frame(maxWidth: .infinity).frame(height: 52)
-                            }
-                            .buttonStyle(RogButtonStyle(selected: g.mode == v, cut: 8))
-                            .help(info.2).accessibilityLabel("GPU mode \(info.0)").accessibilityAddTraits(g.mode == v ? .isSelected : [])
-                        }
-                        VStack(spacing: 4) {
-                            Image(systemName: "bolt.fill").font(.system(size: 14))
-                            Text("Ultimate").font(.system(size: 12))
-                        }
-                        .frame(maxWidth: .infinity).frame(height: 52).foregroundStyle(T.faint).opacity(0.6)
-                        .background(T.raised.opacity(0.5), in: Chamfer(cut: 8))
-                        .help("Not available: Ultimate sends the panel to the RTX, and this Mac draws the desktop on the Radeon 890M.")
-                        .accessibilityLabel("GPU mode Ultimate, not available")
-                    }
-                    .disabled(!usable).opacity(usable ? 1 : 0.5)
-                    Text(usable ? Self.modes[g.mode == 1 ? 0 : g.mode == 0 ? 1 : 2].2 : status(g)).font(.system(size: 11)).foregroundStyle(T.dim)
-                        .fixedSize(horizontal: false, vertical: true)
-                    ErrorLine(text: m.gpuError)
-                }
-                .frame(maxWidth: .infinity, alignment: .topLeading)
-                if usable {
-                    Rectangle().fill(T.line).frame(width: 1)
-                    VStack(alignment: .leading, spacing: 9) {
-                        kv("Requested", g.requestedName)
-                        kv("Running now", g.runningName + (g.tripped ? ", Eco did not finish" : ""))
-                        HStack { Text("RTX").font(.system(size: 11.5)).foregroundStyle(T.dim); Spacer(); RtxBadge(g: g) }
-                        HStack {
-                            Text("Takes effect").font(.system(size: 11.5)).foregroundStyle(T.dim); Spacer()
-                            if pending {
-                                Label("Restart required", systemImage: "arrow.clockwise.circle.fill").font(.system(size: 11, weight: .semibold)).foregroundStyle(T.amber)
-                            } else { Text("Applied").font(.system(size: 11.5)).foregroundStyle(T.text) }
-                        }
-                        if g.tripped {
-                            Label("The last Eco start did not finish, so this start kept the RTX on. Choose Eco again to retry.", systemImage: "exclamationmark.triangle.fill")
-                                .font(.system(size: 10.5)).foregroundStyle(T.amber).fixedSize(horizontal: false, vertical: true)
-                        }
-                    }
-                    .frame(width: 300, alignment: .topLeading)
+            VStack(alignment: .leading, spacing: 6) {
+                ForEach([[1, 0], [2, -1]], id: \.self) { pair in        // Eco, Standard / Optimized, Ultimate (-1, not available)
+                    HStack(spacing: 6) { ForEach(pair, id: \.self) { v in v < 0 ? AnyView(ultimate) : AnyView(button(v, g)) } }
                 }
             }
+            .disabled(!usable).opacity(usable ? 1 : 0.5)
             .padding(.top, 8)
+            Text(usable ? Self.short[g.mode == 1 ? 0 : g.mode == 0 ? 1 : 2] : status(g)).font(.system(size: 11)).foregroundStyle(T.dim)
+                .fixedSize(horizontal: false, vertical: true).padding(.top, 8)
+                .help(usable ? Self.modes[g.mode == 1 ? 0 : g.mode == 0 ? 1 : 2].2 : "")
+            ErrorLine(text: m.gpuError)
+            Spacer(minLength: 8)
+            if usable {
+                HStack(alignment: .top, spacing: 14) {
+                    stat("Requested", Text(g.requestedName))
+                    stat("Running", Text(g.runningName))
+                    stat("RTX", RtxBadge(g: g))
+                    stat("Applies", pending
+                         ? AnyView(Label("Restart", systemImage: "arrow.clockwise.circle.fill").font(.system(size: 11, weight: .semibold)).foregroundStyle(T.amber))
+                         : AnyView(Text("Applied")))
+                }
+                if g.tripped {
+                    Label("Last Eco start failed, RTX stayed on. Choose Eco to retry.", systemImage: "exclamationmark.triangle.fill")
+                        .help("The last Eco start did not finish, so this start kept the RTX on (loop guard).")
+                        .font(.system(size: 10.5)).foregroundStyle(T.amber).fixedSize(horizontal: false, vertical: true).padding(.top, 6)
+                }
+            }
         }
+    }
+    func button(_ v: Int, _ g: GpuState) -> some View {
+        let info = Self.modes[v == 1 ? 0 : v == 0 ? 1 : 2]
+        return Button { m.setGpuMode(v) } label: {
+            HStack(spacing: 7) {
+                Image(systemName: info.1).font(.system(size: 13))
+                Text(info.0).font(.system(size: 12, weight: g.mode == v ? .semibold : .regular))
+            }
+            .frame(maxWidth: .infinity).frame(height: 32)
+        }
+        .buttonStyle(RogButtonStyle(selected: g.mode == v, cut: 8))
+        .help(info.2).accessibilityLabel("GPU mode \(info.0)").accessibilityAddTraits(g.mode == v ? .isSelected : [])
+    }
+    var ultimate: some View {
+        HStack(spacing: 7) {
+            Image(systemName: "bolt.fill").font(.system(size: 13))
+            Text("Ultimate").font(.system(size: 12))
+        }
+        .frame(maxWidth: .infinity).frame(height: 32).foregroundStyle(T.faint).opacity(0.6)
+        .background(T.raised.opacity(0.5), in: Chamfer(cut: 8))
+        .help("Not available: Ultimate sends the panel to the RTX, and this Mac draws the desktop on the Radeon 890M.")
+        .accessibilityLabel("GPU mode Ultimate, not available")
+    }
+    func stat<V: View>(_ k: String, _ v: V) -> some View {
+        VStack(alignment: .leading, spacing: 4) { Caps(k); v.font(.system(size: 11.5)).foregroundStyle(T.text).lineLimit(1) }
     }
     func kv(_ k: String, _ v: String) -> some View {
         HStack { Text(k).font(.system(size: 11.5)).foregroundStyle(T.dim); Spacer(); Text(v).font(.system(size: 11.5)).foregroundStyle(T.text) }
@@ -1691,32 +1702,19 @@ struct GpuTile: View {
     }
 }
 
-// Collapsible detail for people who debug the drivers: the gate's view of the RTX, the AC-change heartbeat, the CPU policy.
-struct DiagnosticsCard: View {
+// Detail for people who debug the drivers: the gate's view of the RTX, the AC-change heartbeat, the CPU policy. A dialog
+// opened from the header, so the window fits a 900 pt screen.
+struct DiagnosticsView: View {
     @ObservedObject var m: RogModel
     var body: some View {
-        Card(pad: 14) {
-            Button { withAnimation(.easeOut(duration: 0.15)) { m.diagOpen.toggle() } } label: {
-                HStack(spacing: 8) {
-                    Caps("Diagnostics")
-                    Text("GPU gate, power-source heartbeat, CPU policy").font(.system(size: 11)).foregroundStyle(T.faint)
-                    Spacer()
-                    Image(systemName: m.diagOpen ? "chevron.up" : "chevron.down").font(.system(size: 10, weight: .bold)).foregroundStyle(T.dim)
-                }
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain).accessibilityLabel("Diagnostics").accessibilityValue(m.diagOpen ? "expanded" : "collapsed")
-            if m.diagOpen {
-                HStack(alignment: .top, spacing: 18) {
-                    column("RTX power gate") { gateRows }
-                    Rectangle().fill(T.line).frame(width: 1)
-                    column("Power-source heartbeat") { heartbeatRows }
-                    Rectangle().fill(T.line).frame(width: 1)
-                    column("System") { systemRows }
-                }
-                .padding(.top, 12)
-            }
+        HStack(alignment: .top, spacing: 18) {
+            column("RTX power gate") { gateRows }
+            Rectangle().fill(T.line).frame(width: 1)
+            column("Power-source heartbeat") { heartbeatRows }
+            Rectangle().fill(T.line).frame(width: 1)
+            column("System") { systemRows }
         }
+        .fixedSize(horizontal: false, vertical: true)      // the dividers take the columns' height, not the window's
     }
     func column<C: View>(_ title: String, @ViewBuilder _ c: () -> C) -> some View {
         VStack(alignment: .leading, spacing: 7) { Caps(title); c() }.frame(maxWidth: .infinity, alignment: .topLeading)
@@ -1851,40 +1849,44 @@ struct LightingTile: View {
                 Text("Lighting needs AsusWmi ABI 3 and the N-KEY keyboard.").font(.system(size: 11)).foregroundStyle(T.dim).padding(.top, 10)
             } else {
                 TileHead(title: "Lighting", action: "Animations") { m.dialog = .slash }
-                HStack(spacing: 10) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Caps("Slash")
-                        Text(slash.bright > 0 ? Slash.modes[min(slash.mode, Slash.modes.count - 1)] : "Off").font(T.num(18)).foregroundStyle(T.text)
+                HStack(alignment: .bottom, spacing: 0) {           // one strip across the window: Slash, its brightness, keyboard, Aura
+                    HStack(spacing: 14) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Caps("Slash")
+                            Text(slash.bright > 0 ? Slash.modes[min(slash.mode, Slash.modes.count - 1)] : "Off").font(T.num(18)).foregroundStyle(T.text)
+                        }
+                        Toggle("Slash", isOn: slashOn(m)).toggleStyle(.switch).labelsHidden().tint(T.red)
                     }
-                    Spacer()
-                    Toggle("Slash", isOn: slashOn(m)).toggleStyle(.switch).labelsHidden().tint(T.red)
-                }
-                .padding(.top, 8)
-                Spacer(minLength: 10)
-                HStack {
-                    Text("Brightness").font(.system(size: 12)).foregroundStyle(T.text); Spacer()
-                    Pills(items: ["Low", "Med", "High"], selected: max(1, slash.bright) - 1, minWidth: 30, pad: 7, label: "Slash brightness") {
-                        var s = slash; s.bright = $0 + 1; m.setSlash(s)
+                    Spacer(minLength: 20)
+                    group("Slash brightness") {
+                        Pills(items: ["Low", "Med", "High"], selected: max(1, slash.bright) - 1, minWidth: 30, pad: 7, label: "Slash brightness") {
+                            var s = slash; s.bright = $0 + 1; m.setSlash(s)
+                        }
+                        .disabled(slash.bright == 0).opacity(slash.bright == 0 ? 0.5 : 1)
                     }
-                    .disabled(slash.bright == 0).opacity(slash.bright == 0 ? 0.5 : 1)
-                }
-                HStack {
-                    Text("Keyboard").font(.system(size: 12)).foregroundStyle(T.text); Spacer()
-                    Pills(items: ["Off", "Low", "Med", "High"], selected: m.st.kbd, minWidth: 28, pad: 6, label: "Keyboard") { m.setKbd($0) }
-                        .disabled(m.st.kbd == nil)
-                        .help("Fn+F2 and Fn+F3 change it too")
-                }
-                .padding(.top, 8)
-                HStack {
-                    Text("Aura").font(.system(size: 12)).foregroundStyle(T.text); Spacer()
-                    Pills(items: Self.auraModes, selected: m.st.aura, minWidth: 28, pad: 6, label: "Aura mode") { m.setAura($0) }
-                        .disabled(!m.st.hasAura)
-                        .help(m.st.hasAura ? "Fn+F4 steps through them too" : "Needs AsusWmi 0.2.2 (ABI 5): restart after installing it")
+                    Spacer(minLength: 20)
+                    group("Keyboard") {
+                        Pills(items: ["Off", "Low", "Med", "High"], selected: m.st.kbd, minWidth: 28, pad: 6, label: "Keyboard") { m.setKbd($0) }
+                            .disabled(m.st.kbd == nil)
+                            .help("Fn+F2 and Fn+F3 change it too")
+                    }
+                    Spacer(minLength: 20)
+                    group("Aura") {
+                        Pills(items: Self.auraModes, selected: m.st.aura, minWidth: 28, pad: 6, label: "Aura mode") { m.setAura($0) }
+                            .disabled(!m.st.hasAura)
+                            .help(m.st.hasAura ? "Fn+F4 steps through them too" : "Needs AsusWmi 0.2.2 (ABI 5): restart after installing it")
+                    }
                 }
                 .padding(.top, 8)
                 ErrorLine(text: m.lightingError).padding(.top, 6)
             }
         }
+    }
+}
+
+extension LightingTile {
+    func group<C: View>(_ title: String, @ViewBuilder _ c: () -> C) -> some View {
+        VStack(alignment: .leading, spacing: 6) { Caps(title); c() }
     }
 }
 
@@ -2074,9 +2076,10 @@ struct DialogShell: View {
                     case .battery: BatteryDetails(m: m)
                     case .settings: SettingsEditor(m: m)
                     case .doctor: DoctorView(m: m)
+                    case .diagnostics: DiagnosticsView(m: m)
                     }
                 }
-                .disabled(!m.st.present && kind != .settings && kind != .doctor)
+                .disabled(!m.st.present && kind != .settings && kind != .doctor && kind != .diagnostics)
             }
             .padding(20).frame(width: kind.width)
             .background(T.surface, in: Chamfer(cut: 16)).overlay(Chamfer(cut: 16).stroke(T.line))
@@ -3035,7 +3038,8 @@ enum Snapshot {
                to: out.appendingPathComponent("popover\(tag).png"))
         // the window is always dark: the main screen, then each dialog over it
         let shots: [(String, RogDialog?)] = [("1-main", nil), ("2-limits", .limits), ("3-fans", .fans), ("4-slash", .slash),
-                                             ("5-battery", .battery), ("6-settings", .settings), ("7-doctor", .doctor)]
+                                             ("5-battery", .battery), ("6-settings", .settings), ("7-doctor", .doctor),
+                                             ("8-diagnostics", .diagnostics)]
         // the guided fix, drawn whether or not this machine needs it
         var demo = DoctorCheck(group: "Fn keys", title: "Input Monitoring", detail: "rogkeyd has no access, so the Fn keys do nothing.", level: .fail)
         demo.guide = Doctor.permissionGuide(service: "ListenEvent", pane: "Privacy_ListenEvent", name: "Input Monitoring")
@@ -3052,7 +3056,7 @@ enum Snapshot {
                    to: out.appendingPathComponent("window-\(name)\(tag).png"))
         }
         // GPU mode scenarios: Eco running, restart needed (asked Standard, booted Eco), loop guard tripped
-        m.dialog = nil; m.diagOpen = true
+        m.dialog = nil
         m.gate = GateInfo(present: true, state: "eco: powered off via PEGP _DSM 0x1A + _PS3", gstaBefore: 1, gstaAfter: 0, psc: 3, vendorAfter: 0xffff,
                           events: 2, src: "acad", ac: 1, ticks: 80, flips: 1, firstFlipMs: 1250, maxGapMs: 262,
                           ring: ["t=0 ac=0 gsta=0 v=ffff", "t=250 ac=0 gsta=0 v=ffff", "t=500 ac=1 gsta=0 v=ffff", "t=750 ac=1 gsta=1 v=ffff"])
