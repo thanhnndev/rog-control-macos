@@ -1,7 +1,8 @@
 # asusctl / ROG Control Center on macOS
 
-> **Status 2026-10-12 (owner-confirmed):** profiles, power limits, fan curves and speeds, charge limit, keyboard light, Slash and the
-> RogControl app all work on the reference unit. "built, untested" labels in older sections below are history; the table is updated.
+> **Status 2026-10-12 (owner-confirmed):** profiles, fan curves and speeds, charge limit, keyboard light, Slash and the
+> RogControl app all work on the reference unit. Manual power limits: corrected 2026-11-27, see the table (the write
+> reports a firmware error, and no measurement shows that the limit applies). "built, untested" labels in older sections below are history; the table is updated.
 
 [asusctl](https://github.com/opengamingcollective/asusctl) (formerly <https://gitlab.com/asus-linux/asusctl>, by Luke Jones
 and the asus-linux contributors, **MPL-2.0**) is the Linux daemon (`asusd`), CLI (`asusctl`) and GUI (`rog-control-center`)
@@ -23,7 +24,7 @@ highest performance, so the limit sits in the platform. The profile and the PPT 
 | asusctl feature | Linux path | macOS route | Status |
 |---|---|---|---|
 | Platform profile (Silent / Balanced / Turbo, the G-Helper names) | `asus-wmi` throttle_thermal_policy, WMI dev `0x00120075` (0 balanced = Armoury Crate "Performance", 1 turbo, 2 silent) | AsusWmi user client, RogControl | ✅ works (owner-confirmed 2026-10-12) |
-| CPU power limits SPL / SPPT / FPPT ("Manual") | `asus-armoury` ppt_*; GA403WM: AC 15-80 / 25-80 / 35-80 W, battery 15-35 / 25-35 / 35-65 W; `requires_fan_curve` | AsusWmi checks the range for the current source (ACPI `ACAD._PSR`) and refuses limits until a custom fan curve is active (EBUSY / `kIOReturnNotPermitted`), as asus-armoury does | ✅ works (owner-confirmed 2026-10-12) |
+| CPU power limits SPL / SPPT / FPPT ("Manual") | `asus-armoury` ppt_*; GA403WM: AC 15-80 / 25-80 / 35-80 W, battery 15-35 / 25-35 / 35-65 W; `requires_fan_curve` | AsusWmi checks the range for the current source (ACPI `ACAD._PSR`) and refuses limits until a custom fan curve is active (EBUSY / `kIOReturnNotPermitted`), as asus-armoury does | ⚠️ not verified. The 2026-10-12 "works" had no power measurement. Every write reports a firmware error: the BIOS's `ALIB` 0x0C handler `A032` sends the SMU message and has no `Return`, so WMNB aborts (details below). Whether the SMU applies the limit is not measured yet; the fix that counts this case as sent is PR #23 (AsusWmi 0.3.3, not merged) |
 | Fan curves | dev `0x00110024` (CPU) / `0x00110025` (GPU); DSTS with arg1 = profile returns 8 temps + 8 duties; DEVS packs them into 4 dwords | read and write in AsusWmi (0.3.2: the firmware's own curves are accepted as they are, including the unused 255 °C point and repeated temperatures; other curves: 20..105 °C and duties not falling, 40 % reached by 85 °C; tested by `scripts/test-asuswmi.sh`); RogControl "Manual" uses a chosen firmware curve (Silent / Balanced / Turbo) as the custom curve; no curve editor yet | ✅ works (owner-confirmed 2026-10-12) |
 | Fan speeds | dev `0x00110013` / `0x00110014`, value x 100 rpm | RogControl | ✅ works (owner-confirmed 2026-10-12) |
 | Battery charge limit | dev `0x00120057` | RogControl 60 / 80 / 100 %, re-applied at start | ✅ works (owner-confirmed 2026-10-12) |
@@ -80,6 +81,11 @@ Decompiled from `/Volumes/ESP/SysReport/ACPI/DSDT.aml` with `iasl` (ACPICA sourc
   id 7, `0x001200C1` FPPT -> id 6, value in mW (`IIA1 * 1000`). The `DSTS` read of those ids is a constant `0x00010000`
   (present, value 0): the BIOS does not report the current limit, so `status` shows 0 for them.
   `0x001200B0` / `0x001200B1` (APU / platform SPPT) are unsupported here.
+* In SSDT-1, `ALIB` 0x0C does `Local0 = A032 (Arg1)`. `A032` sends the SMU message through `A018` (0x14 SPL, 0x16 SPPT,
+  0x15 FPPT) and then returns nothing (only id 0x30 returns a value). The store of no value is an AML error, WMNB stops,
+  and `evaluateObject` fails, so AsusWmi up to 0.3.2 reports every PPT write as failed. Same pattern as `A026` in
+  `ACAD._PSR`, which the reference EFI patches. Patching `ALIB` itself is not an option: `XL0B` in SSDT-11 uses the
+  return value of `ALIB` 0x0C id 0x30. (Found 2026-11-27 by reading the ACPI dump; not measured.)
 * `0x00120099` (NVIDIA base TGP) reads a constant 55 W; `0x001200C0` dynamic boost and `0x001200C2` temp target write ACPI
   fields of `NPCF` / `PEGP` and notify the NVIDIA driver.
 * The profile (`0x00120075`), the charge limit (`0x00120057`) and anything else not listed go through `WCHK` + `W15H`: a
