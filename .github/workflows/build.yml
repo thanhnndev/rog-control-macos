@@ -24,6 +24,9 @@ jobs:
       - name: Fan-curve decoding test
         run: bash scripts/test-rogcontrol.sh
 
+      - name: AsusWmi fan-curve check test
+        run: bash scripts/test-asuswmi.sh
+
       - name: Build the app, rogkeyd and the CPU policy daemon
         run: |
           bash scripts/build-rogcontrol.sh
